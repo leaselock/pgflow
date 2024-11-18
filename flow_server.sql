@@ -1,0 +1,968 @@
+/* extends async.sql into dependency chain processing and directly interacts
+ * with its structures.
+ */
+\if :bootstrap
+
+-- CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+/* describes specific processing chains. yardi_operational, entrata etc. */
+CREATE TABLE flow.flow_configuration
+(
+  flow TEXT PRIMARY KEY
+);
+
+/* 
+ * organizes work in dependency terms against a thing as instanced in the flow 
+ * itself. Can have work in itself (which runs first) as well as underlying 
+ * concurrent.  work is complete when all underlying stpes are complete.
+ */
+CREATE TABLE flow.node
+(
+  node TEXT PRIMARY KEY CHECK (node SIMILAR TO '[a-z]+[a-z_0-9]*.?[a-z_0-9]*'), 
+
+  target TEXT REFERENCES async.target ON UPDATE CASCADE ON DELETE CASCADE,
+
+  /* callback to invoke.  presumed to be node unless given differently 
+   * for example, if many nodes hit the same target.
+   */
+  /* use this as callback */
+  routine TEXT DEFAULT NULL,
+  /* use this as callback if node (priority over 'routine') */
+  node_routine TEXT DEFAULT NULL,
+  /* use this as callback if step (priority over 'routine') */
+  step_routine TEXT DEFAULT NULL,
+
+  priority INT DEFAULT 0,
+
+  /* if set true, any step failing will immedaitely cause this node to stop 
+   * processing (and cancel any work if there is any )
+   */
+  all_steps_must_complete BOOL DEFAULT true,
+
+  /* task will immediately resolve complete when scheduled.  Set to true when
+   * all interesting processing is within the steps themselves.  It's tempting
+   * to assume this if there are steps, but frequently the node may itself push
+   * steps dynamically.
+   */
+  empty BOOL DEFAULT false,
+
+  /* If not null, each step will create a flow based on its own arguments.
+   * There may not be any configured steps in that case.
+   */
+  steps_to_flow TEXT,
+
+  /* overrides target asynchronous flag.  Set true when steps are configured
+   * in the node locally.  If the node target is synchronous, this does nothing.
+   */
+  synchronous BOOL DEFAULT FALSE
+
+);
+
+CREATE INDEX ON flow.node(target);
+
+/* ataches a node to a flow.  Mainly used to place nodes with no dependencies */
+CREATE TABLE flow.flow_node
+(
+  flow TEXT REFERENCES flow.flow_configuration 
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  node TEXT REFERENCES flow.node ON UPDATE CASCADE ON DELETE CASCADE,
+
+  /* true if there are no paths from parent to any child that cross
+   * through a continue_on_failure dependency, false if unknown or known to 
+   * be false.  Can be computed from dependences, and is used to prevent 
+   * creating 'DOA' tasks if they are not needed for dependency reasons.
+   *
+   * this is set up during configuration.
+   */
+  terminate_on_failure BOOL,  
+
+  PRIMARY KEY (flow, node)
+);
+
+CREATE TABLE flow.dependency_configuration
+(
+  flow TEXT REFERENCES flow.flow_configuration ON DELETE CASCADE,
+  parent TEXT REFERENCES flow.node(node) ON DELETE CASCADE,
+  child TEXT REFERENCES flow.node(node) ON DELETE CASCADE,  
+
+  continue_on_failure BOOL DEFAULT FALSE,
+
+  PRIMARY KEY(flow, parent, child)
+);
+
+/* resident 1,2,3.. differentiated only by arguments and no external 
+ * dependencies. 
+ */
+CREATE TABLE flow.step
+(
+  node TEXT REFERENCES flow.node ON UPDATE CASCADE ON DELETE CASCADE,
+  arguments JSONB,
+
+  PRIMARY KEY (node, arguments)
+);
+
+/* do not run these nodes concurrently
+ *
+ * XXX: not implemented
+ */
+CREATE TABLE flow.mutex
+(
+  left_node TEXT REFERENCES flow.node ON UPDATE CASCADE ON DELETE CASCADE,
+  right_node TEXT REFERENCES flow.node ON UPDATE CASCADE ON DELETE CASCADE,
+  PRIMARY KEY (left_node, right_node)
+);
+
+CREATE INDEX ON flow.mutex(right_node);
+
+/* yardi_operational, entrata, etc...one per property? */
+CREATE TABLE flow.flow
+(
+  flow_id BIGSERIAL PRIMARY KEY,
+  flow TEXT NOT NULL REFERENCES flow.flow_configuration,
+  arguments JSONB,
+  created TIMESTAMPTZ DEFAULT now(),
+  processed TIMESTAMPTZ,
+
+  /* if created from a step, when the flow resolves, go back and mark that 
+   * step complete as well.
+   */
+  parent_task_id BIGINT REFERENCES async.task ON DELETE CASCADE,
+
+  /* if non-null, nodes not in this list will not be processed. */
+  only_these_nodes TEXT[]
+
+);
+
+CREATE INDEX ON flow.flow(flow);
+CREATE INDEX ON flow.flow(parent_task_id);
+
+CREATE OR REPLACE FUNCTION flow.finish_parent() RETURNS TRIGGER AS
+$$
+BEGIN
+  IF old.processed IS NOT NULL
+  THEN
+    RETURN new;
+  END IF;
+
+  PERFORM async.finish(
+    array[new.parent_task_id],
+    'FINISHED'::async.finish_status_t, /* flows do not carry error state up to parent steps */
+    format('via finishing of flow %s', new.flow_id))
+  FROM async.task t
+  WHERE task_id = new.parent_task_id;
+
+  IF NOT FOUND 
+  THEN
+    RAISE EXCEPTION 'Unable to find parent_task_id % for flow %',
+      new.parent_task_id, new.flow_id;
+  END IF;
+
+  RETURN new;
+END;
+$$ LANGUAGE PLPGSQL;
+
+CREATE OR REPLACE TRIGGER on_flow_update
+  AFTER INSERT OR UPDATE ON flow.flow
+  FOR EACH ROW WHEN (
+    new.processed IS NOT NULL
+    AND new.parent_task_id IS NOT NULL
+  )  
+  EXECUTE PROCEDURE flow.finish_parent();
+
+
+CREATE TABLE flow.dependency
+(
+  flow_id INT REFERENCES flow.flow ON DELETE CASCADE,
+  parent TEXT REFERENCES flow.node ON DELETE CASCADE,
+  child TEXT REFERENCES flow.node ON DELETE CASCADE,
+
+  continue_on_failure BOOL,
+
+  PRIMARY KEY(flow_id, parent, child)
+);
+
+CREATE INDEX ON flow.dependency(child, flow_id);
+
+CREATE TYPE flow.task_wrapper_t AS
+(
+  node TEXT,
+  step_arguments JSONB
+);
+
+
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
+  ( 
+    (((task_data)->>'flow_id')::BIGINT),
+    ((task_data)->>'node'),
+    ((task_data)->'step_arguments')
+  )
+WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
+
+\endif
+
+
+CREATE OR REPLACE FUNCTION flow.is_node(_step_arguments JSONB) RETURNS BOOL AS
+$$
+  SELECT _step_arguments = '{}'::JSONB;
+$$ LANGUAGE SQL IMMUTABLE;
+
+
+CREATE OR REPLACE FUNCTION flow.configure_callback(
+  _callback TEXT,
+  _flow_id BIGINT,
+  _flow TEXT,
+  _node TEXT,
+  _step_arguments JSONB,
+  _steps_to_flow TEXT) RETURNS TEXT AS
+$$
+  SELECT 
+    CASE WHEN _callback = '' THEN ''
+    ELSE format(
+      'CALL %s((%s, %s, flow.args(%s), %s, %s::JSONB, ##flow.TASK_ID##)::flow.callback_arguments_t)',
+      _callback,
+      _flow_id,
+      quote_literal(_flow),
+      _flow_id,
+      quote_literal(_node),
+      quote_literal(_step_arguments))
+    END
+  WHERE _steps_to_flow IS NULL OR flow.is_node(_step_arguments)
+  UNION ALL SELECT format(
+    'SELECT flow.create_flow(%s, %s::jsonb, _parent_task_id := ##flow.TASK_ID##)',
+    quote_literal(_steps_to_flow),
+    quote_literal(_step_arguments))
+  WHERE NOT (_steps_to_flow IS NULL OR flow.is_node(_step_arguments))
+$$ LANGUAGE SQL IMMUTABLE;
+
+
+CREATE OR REPLACE FUNCTION flow.task_data(
+  _flow_id BIGINT,
+  _node TEXT,
+  _step_arguments JSONB) RETURNS TEXT AS
+$$
+  SELECT jsonb_build_object(
+    'flow_id', _flow_id,
+    'node', _node,
+    'step_arguments', _step_arguments);
+$$ LANGUAGE SQL IMMUTABLE;
+
+/* Creates and sends tasks to async for processing.  It's tempting to locally 
+ * record tasks for tracking purposes to simplify dependency lookups over the 
+ * task table, but this introduces race conditions crossing the asynchronous
+ * call boundary, for example task might compute before the local transaction
+ * resolves.
+ */
+CREATE OR REPLACE FUNCTION flow.push_tasks(
+  _flow_id BIGINT,
+  _tasks flow.task_wrapper_t[],
+  _run_type async.task_run_type_t DEFAULT 'EXECUTE',
+  _source TEXT DEFAULT NULL) RETURNS VOID AS 
+$$
+
+  SELECT
+    async.push_tasks(array_agg(
+      (
+        flow.task_data(
+          _flow_id,
+          t.node,
+          t.step_arguments),
+        n.target,
+        n.priority,
+        flow.configure_callback(
+          CASE WHEN flow.is_node(t.step_arguments) 
+            THEN COALESCE(n.node_routine, n.routine, n.node)
+            ELSE COALESCE(n.step_routine, n.routine, n.node)
+          END,
+          _flow_id,
+          flow,
+          node,
+          step_arguments,
+          n.steps_to_flow),
+        NULL
+      )::async.task_push_t),
+    CASE 
+      WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
+        THEN 'EXECUTE_NOASYNC'
+      ELSE _run_type
+    END,
+    _source)
+  FROM flow.flow f
+  CROSS JOIN 
+  (
+    SELECT  
+      node,
+      step_arguments
+    FROM unnest(_tasks) t
+  ) t
+  JOIN flow.node n USING(node)
+  WHERE f.flow_id = _flow_id
+  GROUP BY CASE 
+      WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
+        THEN 'EXECUTE_NOASYNC'
+      ELSE _run_type
+    END;
+$$ LANGUAGE SQL;
+
+
+/* extends the async.task to have the json stored elements be produced as 
+ * columns.  They are likely going to be indexed, so it's good to formalize
+ * access to them.
+ */ 
+CREATE OR REPLACE VIEW flow.v_flow_task AS 
+  SELECT 
+    t.*,
+    (task_data->>'flow_id')::BIGINT AS flow_id,
+    task_data->>'node' AS node,
+    task_data->'step_arguments' AS step_arguments,
+    flow.is_node(task_data->'step_arguments') AS is_node
+  FROM async.task t
+  /* important guard for partial index */
+  WHERE (task_data->>'flow_id')::BIGINT IS NOT NULL;
+
+
+
+
+
+
+CREATE OR REPLACE FUNCTION flow.create_flow(
+  _flow TEXT,
+  _arguments JSONB,
+  _only_these_nodes TEXT[] DEFAULT NULL, 
+  _add_parents BOOL DEFAULT FALSE, /* XXX: not implemented */
+  _add_children BOOL DEFAULT FALSE, /* XXX: not implemented */
+  _parent_task_id BIGINT DEFAULT NULL,
+  flow_id OUT BIGINT) RETURNS BIGINT AS
+$$
+BEGIN
+  INSERT INTO flow.flow(flow, arguments, parent_task_id, only_these_nodes)
+  SELECT 
+    _flow,
+    _arguments,
+    _parent_task_id,
+    _only_these_nodes
+  FROM flow.flow_configuration
+  WHERE flow = _flow
+  RETURNING flow.flow_id INTO create_flow.flow_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Missing flow configuration %', _flow;
+  END IF;
+
+  /* Copy the dependency configuration into the flow_id based instance, so that
+   * dependences 'as processed' are preserved. 
+   */
+  INSERT INTO flow.dependency SELECT 
+    create_flow.flow_id,
+    parent,
+    child,
+    continue_on_failure
+  FROM flow.dependency_configuration dc
+  WHERE dc.flow = _flow;
+
+  /* Push task from nodes that have no parent */
+  PERFORM flow.push_tasks(
+    create_flow.flow_id,
+    array_agg((node, '{}')::flow.task_wrapper_t),
+    CASE 
+      WHEN empty THEN 'EMPTY' 
+      WHEN _only_these_nodes IS NULL THEN 'EXECUTE'
+      WHEN node = ANY(_only_these_nodes) THEN 'EXECUTE'
+      ELSE 'EMPTY'
+    END::async.task_run_type_t,
+    'create flow')
+  FROM
+  (
+    SELECT 
+      fn.node,
+      n.empty
+    FROM flow.flow_node fn
+    JOIN flow.node n USING(node)
+    WHERE 
+      fn.flow = _flow
+      AND NOT EXISTS (
+        SELECT 1 FROM flow.dependency d2
+        WHERE 
+          d2.flow_id = create_flow.flow_id
+          AND d2.child = fn.node
+      )
+  ) q
+  GROUP BY CASE 
+      WHEN empty THEN 'EMPTY' 
+      WHEN _only_these_nodes IS NULL THEN 'EXECUTE'
+      WHEN node = ANY(_only_these_nodes) THEN 'EXECUTE'
+      ELSE 'EMPTY'
+    END::async.task_run_type_t;
+
+  /* do we actually have to do anything? */
+  IF NOT EXISTS (
+    SELECT 1 FROM flow.v_flow_task t
+    WHERE t.flow_id = create_flow.flow_id)
+  THEN
+    UPDATE flow.flow f SET processed = clock_timestamp()
+    WHERE f.flow_id = create_flow.flow_id;
+  END IF;
+END;
+$$ LANGUAGE PLPGSQL;
+
+/* for a parent node, gives each child node and for those nodes if child
+ * dependency requirements are met, so that child tasks can be queued.
+ *
+ *
+ * problem, node child eligible brfore steps complete
+ */
+CREATE OR REPLACE FUNCTION flow.node_child_dependencies(
+  _flow_id BIGINT,
+  _parent TEXT,
+  child OUT TEXT,
+  eligible OUT BOOL,
+  run_type OUT async.task_run_type_t,
+  ineligible_parents OUT TEXT[]) RETURNS SETOF RECORD AS
+$$
+  SELECT
+    d.child,
+    /* check both node and steps if any */
+    count(*) FILTER (WHERE t.processed IS NULL) = 0,
+    CASE 
+      WHEN bool_or(t.failed AND NOT d2.continue_on_failure) THEN 'DOA'
+      WHEN n.empty THEN 'EMPTY'
+      WHEN f.only_these_nodes IS NULL THEN 'EXECUTE'
+      WHEN d.child = ANY(f.only_these_nodes) THEN 'EXECUTE'
+      ELSE 'EMPTY'
+    END::async.task_run_type_t,  
+    array_agg(d2.parent) FILTER (WHERE t.processed IS NULL)
+  FROM flow.dependency d
+  JOIN flow.flow f ON f.flow_id = _flow_id
+  JOIN flow.node n ON d.child = n.Node
+  JOIN flow.dependency d2 ON 
+    d2.flow_id = d.flow_id
+    AND d2.child = d.child
+  LEFT JOIN flow.v_flow_task t ON 
+    t.flow_id = d.flow_id
+    AND t.node = d2.parent
+    AND t.is_node
+  WHERE 
+    d.parent = _parent
+    AND d2.child = d.child
+    AND d.flow_id = _flow_id
+  GROUP BY 1, n.empty, f.only_these_nodes;
+$$ LANGUAGE SQL;
+
+
+
+/* push eligible tasks from dependency.
+ *
+ * This is a very special routine that runs inside the async orchestration
+ * process, and is used to push tasks based on dependency processing.  Great
+ * care must be taken for this routine not to fail, although errors are trapped,
+ * it's good to be polite.
+ */
+CREATE OR REPLACE FUNCTION flow.task_complete() RETURNS TRIGGER AS 
+$$
+DECLARE
+  _flow flow.flow;
+  ft flow.v_flow_task;
+  _last_step BOOL;
+  
+BEGIN
+  SELECT INTO ft * FROM flow.v_flow_task WHERE task_id = new.task_id;
+
+  /* look up the flow. if it's not there, we have bigger problems and will
+   * punt.
+   */
+  SELECT INTO _flow * FROM flow.flow WHERE flow_id = ft.flow_id;
+
+  IF NOT FOUND 
+  THEN
+    RAISE EXCEPTION 'Unable to find requeseted flow_id %', ft.flow_id;
+  END IF;
+
+  IF _flow.processed IS NOT NULL
+  THEN
+    /* flow is considered to be finished in terms of processing, so, punt. */
+    RETURN NEW;
+  END IF;
+
+  _last_step := NOT ft.is_node AND NOT EXISTS (
+      SELECT 1 FROM flow.v_flow_task t
+      WHERE 
+        flow_id = ft.flow_id
+        AND node = ft.node
+        AND NOT is_node
+        AND processed IS NULL
+    );
+
+  IF NOT ft.is_node AND _last_step
+  THEN
+    /* all steps mark finished. resolve the node which will then cascade 
+     * dependency processing.  Node finish status is based this step status.
+     */
+    PERFORM async.finish_internal(
+      array[t.task_id], 
+      CASE WHEN ft.failed AND n.all_steps_must_complete 
+        THEN 'FAILED'
+        ELSE 'FINISHED'
+      END::async.finish_status_t, 
+      'task complete last step',
+      CASE WHEN ft.failed AND n.all_steps_must_complete 
+        THEN 'Failed due to steps not completing'
+      END)
+    FROM flow.v_flow_task t
+    JOIN flow.node n USING(node)
+    WHERE
+      flow_id = ft.flow_id
+      AND node = ft.node
+      AND is_node;      
+  ELSEIF NOT ft.is_node AND ft.failed 
+  THEN
+    /* node requires all steps to run and a step failed.  this means:
+     * 1. halt any other running steps attached to this node. 
+     * 2. marked other tasks as ineligible for processing
+     */
+    PERFORM async.finish_internal(
+      array_agg(task_id),
+      'CANCELED'::async.finish_status_t,
+      'task complete failed',
+      format(
+        'Failed due to failure of node %s step %s', 
+        ft.node, 
+        ft.step_arguments))
+    FROM flow.v_flow_task t
+    JOIN flow.node n ON n.node = ft.node
+    WHERE 
+      t.flow_id = ft.flow_id
+      AND NOT is_node
+      AND t.step_arguments != ft.step_arguments
+      AND t.processed IS NULL
+      AND n.all_steps_must_complete
+    HAVING COUNT(*) > 0;
+  ELSEIF ft.is_node
+  THEN
+    /* The node did not have any steps (or did and failed), or this is the last
+     * step to resolve. time to process node dependencies...introduce new task
+     * if there are no other unmet dependencies.
+     *
+     * Upon failure, this is also a convenient time to push children with 
+     * mandatory dependencies to parent out DOA, mainly so that if there is 
+     * downstream 'run after errors' nodes, the dependency queue will trace down 
+     * to them.  This can and will cascade to multiple trigger calls. However,
+     * if the node is known to have no children with 'continue on failure'
+     * set, dependencies will not be processed.
+     */
+
+    IF NOT ft.failed OR NOT (
+      SELECT terminate_on_failure 
+      FROM flow.flow_node fn
+      WHERE 
+        fn.flow = _flow.flow
+        AND fn.node = ft.node)
+    THEN
+      PERFORM flow.push_tasks(
+        ft.flow_id,
+        array_agg(t),
+        run_type,
+        _source := format(
+          'node complete (from task_id %s)',
+          ft.task_id))
+      FROM
+      (
+        SELECT 
+          run_type,
+          (child, '{}')::flow.task_wrapper_t t
+        FROM flow.node_child_dependencies(ft.flow_id, ft.node)
+        WHERE eligible
+      ) q
+      GROUP BY run_type;
+    END IF;
+  END IF;  
+
+  /* test if flow is done and close it if so */
+  IF NOT EXISTS (
+    SELECT 1 FROM flow.v_flow_task 
+    WHERE 
+      flow_id = ft.flow_id
+      AND processed IS NULL)
+  THEN
+    UPDATE flow.flow SET processed = clock_timestamp() 
+    WHERE flow_id = ft.flow_id;
+  END IF;
+
+  RETURN new;
+END;
+$$ LANGUAGE PLPGSQL;
+
+/* directly attaches to async table for dependency processing 
+ * 
+ * Trigger proceses task completion to cascade dependency effects 
+ */
+CREATE OR REPLACE TRIGGER on_flow_task_complete 
+  AFTER INSERT OR UPDATE ON async.task 
+  FOR EACH ROW WHEN (
+    /* do not fire trigger unless... 
+     *
+     * ...task is completing and...
+     */
+    new.processed IS NOT NULL
+    /* ...this is a task attached to flow  and ... */
+    AND (new.task_data->>'flow_id') IS NOT NULL
+    /* this is not a failure that itself is trigger fired */    
+    AND new.finish_status IN ('FINISHED', 'FAILED', 'TIMED_OUT', 'DOA')
+  )  
+  EXECUTE PROCEDURE flow.task_complete();
+
+
+
+/* directly attaches to async table for dependency processing 
+ * 
+ * Trigger intercepts node completion, if (and only if) it has steps, so that 
+ * the node is not considered complete, but is yielded, while the steps are 
+ * processing.  The last step completing (or node timeout) will then force the
+ * node to complete.
+ * 
+ * For asynchronous nodes that have actual work to do, this is a 'second yield',
+ * where the first is for the asynchronous processing response, the second is 
+ * for pending steps.  To demystify this, the 'source' column is adjusted to 
+ * note that yield is pending step completion.  Since this adjusts data en route
+ * to the table, it's a before trigger which will also suppress the regular 
+ * dependence processing trigger.
+ */
+CREATE OR REPLACE FUNCTION flow.check_node_steps() RETURNS TRIGGER AS
+$$
+DECLARE
+  _flow_id INT DEFAULT (new.task_data->>'flow_id')::BIGINT;
+  _node TEXT DEFAULT new.task_data->>'node';
+  f flow.flow;
+BEGIN
+  IF OLD.source = 'step processing'
+  THEN
+    /* bail if task has already been yielded for step processing */
+    RETURN new;
+  END IF;
+
+  /* if we are not running the complete flow, do not push anything if the node 
+   * is not in the list of nodes to run.
+   */
+  SELECT INTO f * from flow.flow WHERE flow_id = _flow_id;
+
+  IF f.only_these_nodes IS NOT NULL AND NOT _node = ANY(f.only_these_nodes)
+  THEN
+    RETURN new;
+  END IF;
+
+  /* to have gotten here, we know that the node is first completing via hacking, 
+   * er, adjusting the source column to track having done this.  Only need to 
+   * check node table to see if it has defined steps, or there are steps stashed
+   * in the task itself via runtime configuration.  If neither are the case,
+   * resolve without adjustment.
+   */
+  PERFORM flow.push_tasks(
+    _flow_id,
+    array_agg(t),
+    _source := 'trigger create steps')
+  FROM
+  (
+    SELECT 
+      (
+        _node,
+        arguments
+      )::flow.task_wrapper_t AS t
+    FROM flow.step s
+    WHERE s.node = _node
+  ) q
+  HAVING COUNT(*) > 0;
+
+  IF EXISTS (
+    SELECT 1 FROM flow.v_flow_task
+    WHERE 
+      flow_id = _flow_id
+      AND node = _node
+      AND NOT is_node)
+  THEN
+    /* yield the task for step processing */
+    new.processed := NULL;
+    new.yielded := clock_timestamp();
+    new.failed := NULL;
+    new.processing_error := NULL;
+    new.finish_status = 'YIELDED';
+    new.source := 'step processing';
+  END IF;
+
+  RETURN new;  
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+CREATE OR REPLACE TRIGGER on_flow_check_node_steps
+  BEFORE INSERT OR UPDATE ON async.task 
+  FOR EACH ROW WHEN (
+    /* do not fire trigger unless... 
+     *
+     * ...task is completing and...
+     */
+    new.processed IS NOT NULL
+    /* ...this is a task attached to flow  and ... */
+    AND (new.task_data->>'flow_id') IS NOT NULL
+
+    /* ...is a node ... */
+    AND flow.is_node(new.task_data->'step_arguments')
+
+    /* this is not a failure that itself is trigger fired */    
+    AND new.finish_status = 'FINISHED'
+  )  
+  EXECUTE PROCEDURE flow.check_node_steps();
+
+
+CREATE OR REPLACE FUNCTION flow.configure_flow(
+  _flow_name TEXT,
+  _configuration JSONB,
+  _append BOOL DEFAULT FALSE) RETURNS VOID AS
+$$
+DECLARE 
+  r RECORD;
+  _flow_configuration JSONB;
+BEGIN
+  CREATE TEMP TABLE tmp_flow (LIKE flow.flow_configuration) ON COMMIT DROP;
+  CREATE TEMP TABLE tmp_node (LIKE flow.node) ON COMMIT DROP;
+
+  ALTER TABLE tmp_node ADD COLUMN dependencies JSONB;
+  ALTER TABLE tmp_node ADD COLUMN steps JSONB[];
+
+  CREATE TEMP TABLE tmp_dependency (
+    LIKE flow.dependency_configuration) ON COMMIT DROP;
+  CREATE TEMP TABLE tmp_step (LIKE flow.step) ON COMMIT DROP;
+  CREATE TEMP TABLE tmp_mutex (LIKE flow.mutex) ON COMMIT DROP;
+
+  _flow_configuration := COALESCE(_configuration->'flow', '{}'::JSONB) ||
+    format('{"flow": "%s"}', _flow_name)::JSONB;
+
+  INSERT INTO tmp_flow SELECT * FROM jsonb_populate_record(
+    null::tmp_flow,
+    _flow_configuration);
+
+  INSERT INTO tmp_node SELECT * FROM jsonb_populate_recordset(
+    null::tmp_node,
+    _configuration->'nodes');
+
+  FOR r IN SELECT * FROM tmp_node
+  LOOP
+    INSERT INTO tmp_dependency
+      SELECT (jsonb_populate_record(null::tmp_dependency, d)).*
+      FROM 
+      (
+        SELECT to_jsonb(j) || format(
+          '{"child": "%s", "flow": "%s"}',
+          r.node,
+          _flow_name)::JSONB AS d
+        FROM jsonb_populate_recordset(
+          null::tmp_dependency,
+          r.dependencies) j
+      ) q;  
+
+    INSERT INTO tmp_step
+      SELECT (jsonb_populate_record(null::tmp_step, s)).*
+      FROM 
+      (
+        SELECT jsonb_build_object(
+          'node', r.node,
+          'arguments', s) AS s
+        FROM unnest(r.steps) s
+      ) q;
+  END LOOP;
+
+  INSERT INTO flow.flow_configuration SELECT * FROM tmp_flow
+    ON CONFLICT DO NOTHING;
+
+  INSERT INTO flow.node (node)
+  SELECT t.node FROM tmp_node t
+  WHERE node NOT IN (SELECT node FROM flow.node);
+
+  INSERT INTO flow.flow_node
+    SELECT _flow_name, node FROM tmp_node 
+    ON CONFLICT DO NOTHING;
+
+  UPDATE flow.node n SET
+    target = COALESCE(t.target, n.target),
+    priority = COALESCE(t.priority, n.priority),
+    all_steps_must_complete = 
+      COALESCE(t.all_steps_must_complete, n.all_steps_must_complete),
+    empty = COALESCE(t.empty, n.empty),
+    steps_to_flow = COALESCE(t.steps_to_flow, n.steps_to_flow),
+    routine = t.routine,
+    node_routine = t.node_routine,
+    step_routine = t.step_routine,
+    synchronous = COALESCE(t.synchronous, n.synchronous)
+  FROM tmp_node t
+  WHERE t.node = n.node;
+
+  INSERT INTO flow.dependency_configuration (flow, parent, child)
+  SELECT flow, parent, child FROM tmp_dependency t
+  WHERE (flow, parent, child) NOT IN (
+    SELECT flow, parent, child FROM flow.dependency_configuration);
+
+  UPDATE flow.dependency_configuration d SET
+    continue_on_failure 
+      = COALESCE(t.continue_on_failure, d.continue_on_failure)
+  FROM tmp_dependency t
+  WHERE (t.flow, t.parent, t.child) = (d.flow, d.parent, d.child);
+
+  INSERT INTO flow.step SELECT * FROM tmp_step
+    ON CONFLICT DO NOTHING;
+
+  INSERT INTO flow.mutex SELECT * FROM tmp_mutex
+    ON CONFLICT DO NOTHING;    
+
+  IF NOT _append
+  THEN
+    DELETE FROM flow.flow_node
+    WHERE flow = _flow_name AND node NOT IN (
+      SELECT node from tmp_node);
+
+    DELETE FROM flow.dependency_configuration 
+    WHERE 
+      flow = _flow_name
+      AND (flow, parent, child) NOT IN (
+        SELECT flow, parent, child FROM tmp_dependency);
+
+    DELETE FROM flow.step 
+    WHERE 
+      (node, arguments) NOT IN (SELECT node, arguments FROM tmp_step)
+      AND node IN (SELECT node FROM tmp_node);
+
+    /* only clean up nodes if they are not attached to ANY flow */
+    DELETE FROM flow.node WHERE node NOT IN (
+      SELECT node FROM flow.flow_node);
+
+  END IF;    
+
+  /* optimize the optimizations! */
+  PERFORM flow.set_terminate_on_failure(_flow_name);
+
+  DROP TABLE tmp_flow;
+  DROP TABLE tmp_node;
+  DROP TABLE tmp_dependency;
+  DROP TABLE tmp_step;
+  DROP TABLE tmp_mutex;
+
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+CREATE OR REPLACE FUNCTION flow.configuration() RETURNS JSONB AS
+$$
+  SELECT jsonb_build_object(
+    'flow', (SELECT jsonb_agg(f) FROM flow.flow_configuration f),
+    'nodes', (SELECT jsonb_agg(n) FROM flow.node n),
+    'steps', (SELECT jsonb_agg(s) FROM flow.step s),
+    'dependencies', (SELECT jsonb_agg(d) FROM flow.dependency_configuration d),
+    'mutexes', (SELECT jsonb_agg(m) FROM flow.mutex m));
+$$ LANGUAGE SQL;
+
+
+CREATE OR REPLACE FUNCTION flow.flow_from_step(
+  _flow TEXT,
+  _step flow.v_flow_task) RETURNS VOID AS
+$$
+  SELECT 
+    flow.create_flow(
+      _flow,
+      f.arguments || _step.step_arguments,
+      _parent_task_id := _step.task_id)
+  FROM flow.node n
+  JOIN flow.flow f ON f.flow_id = _step.flow_id
+  WHERE n.node = _step.node;
+$$ LANGUAGE SQL;
+
+/* walks dependencies collecting facts as it goes. used to support configure
+ * time processing, cylic checks, and other dependency analysis that will 
+ * move processing from runtime to configure time.
+ *
+ * 'parents' means will walk from parents to children, while is appropriate 
+ *    when doing depth checks, or anything that cascades state from top down.
+ *
+ *  anything requiring child up tracking, can't be directly returned from this
+ *  function, for example, terminates_on_failure -- wrappers have to handle 
+ *  that.
+ */
+CREATE OR REPLACE FUNCTION flow.walk_flow(
+  _flow TEXT,
+  parent OUT TEXT,
+  child OUT TEXT,
+  tree OUT TEXT[],
+  continue_on_failure OUT BOOL, /* via dependency */
+  depth OUT INT, /* depth to support cyclic checks */ 
+  node OUT flow.node) RETURNS SETOF RECORD AS 
+$$
+  WITH RECURSIVE nodes AS
+  ( 
+    SELECT 
+      dc.parent, 
+      n.node AS child, 
+      array[n.node] AS tree, 
+      dc.continue_on_failure, 
+      1 AS depth, 
+      n 
+    FROM flow.node n
+    JOIN flow.flow_node fn USING(node)
+    LEFT JOIN flow.dependency_configuration dc ON 
+      n.node = dc.child
+      AND dc.flow = fn.flow
+    WHERE 
+      fn.flow = _flow
+      AND dc.parent IS NULL
+    UNION ALL SELECT 
+      dc.parent, 
+      dc.child,
+      nodes.tree || nc.node,
+      dc.continue_on_failure,
+      nodes.depth + 1,
+      nc
+    FROM nodes
+    JOIN flow.dependency_configuration dc ON 
+      dc.parent = nodes.child
+      AND dc.flow = _flow
+    JOIN flow.node nc ON nc.node = dc.child
+    JOIN flow.flow_node fn USING(node, flow) 
+    WHERE 
+      fn.flow = _flow
+      and nodes.depth <= 100
+  )
+  SELECT * FROM nodes;
+$$ LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION flow.set_terminate_on_failure(
+  _flow TEXT) RETURNS VOID AS
+$$
+BEGIN
+  UPDATE flow.flow_node fn SET terminate_on_failure = q.terminate_on_failure
+  FROM
+  (
+    WITH w AS
+    (
+      SELECT * 
+      FROM flow.walk_flow(_flow)
+    )
+    SELECT 
+      fn.node,
+      NOT COALESCE(bool_or(w.continue_on_failure OR EXISTS (
+        SELECT 1
+        FROM w
+        WHERE 
+          w.continue_on_failure
+          AND fn.node = ANY(tree)
+      )), false) AS terminate_on_failure
+    FROM flow.flow_node fn
+    JOIN w ON fn.node = w.child
+    WHERE fn.flow = _flow
+    GROUP BY fn.node
+  ) q WHERE 
+    fn.node = q.node
+    AND fn.flow = flow;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+
+
+
+
