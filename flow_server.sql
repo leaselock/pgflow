@@ -685,6 +685,7 @@ BEGIN
     new.failed := NULL;
     new.processing_error := NULL;
     new.finish_status = 'YIELDED';
+    new.concurrency_processed = now();
     new.source := 'step processing';
   END IF;
 
