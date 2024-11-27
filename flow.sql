@@ -39,21 +39,30 @@ CREATE TYPE flow.callback_arguments_t AS
  * to be pushed as any other task...the steps much be confirmed before the node
  * resolves.
  *
+ * _flush_transaction_when_client: flow.finish() will attempt to flush 
+ *    transaction changes so that the server does not race to push tasks 
+ *    that may race to start before the calling transaction resolves.  This will
+ *    not work if there is error handling outside of this proceure.  Suppressing
+ *    the commit will allow for upper level error handling to occur. 
  */
-CREATE OR REPLACE FUNCTION flow.push_steps(
+CREATE OR REPLACE PROCEDURE flow.push_steps(
   _flow_id BIGINT,  
   _node TEXT,
-  _arguments JSONB[]) RETURNS VOID AS
+  _arguments JSONB[],
+  _flush_transaction_when_client BOOL DEFAULT TRUE) AS
 $$
-DECLARE
-  _held_steps JSONB;
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
-    PERFORM * FROM dblink(
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
       async.server(), 
       format(
-        'SELECT 0 FROM flow.push_steps(%s, %s, %s)',
+        'CALL flow.push_steps(%s, %s, %s)',
         quote_literal($1),
         quote_literal($2),
         quote_literal($3))) AS R(V int);
@@ -110,23 +119,29 @@ $$ LANGUAGE PLPGSQL;
 
 /* 
  * Will finish 'in-process' node. Useful when the node is set asynchronous, but
- * it is deterimined an asynchronous finish is not needed
+ * it is deterimined an asynchronous finish is not needed.
  */
-CREATE OR REPLACE FUNCTION flow.finish(
+CREATE OR REPLACE PROCEDURE flow.finish(
   _args flow.callback_arguments_t,
   _failed BOOL DEFAULT false,
-  _error_message TEXT DEFAULT NULL) RETURNS VOID AS
+  _error_message TEXT DEFAULT NULL,
+  _flush_transaction_when_client BOOL DEFAULT true) AS
 $$
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
-    PERFORM * FROM dblink(
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
       async.server(), 
       format(
-        'SELECT 0 FROM flow.finish(%s, %s, %s)',
+        'CALL flow.finish(%s, %s, %s)',
         quote_literal($1),
         quote_literal($2),
-        quote_nullable($3))) AS R(V int);
+        quote_nullable($3)));
 
     RETURN;
   END IF; 
