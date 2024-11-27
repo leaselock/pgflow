@@ -65,7 +65,7 @@ BEGIN
         'CALL flow.push_steps(%s, %s, %s)',
         quote_literal($1),
         quote_literal($2),
-        quote_literal($3))) AS R(V int);
+        quote_literal($3)));
 
     RETURN;
   END IF; 
