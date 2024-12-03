@@ -149,11 +149,13 @@ BEGIN
     'FINISHED'::async.finish_status_t, /* flows do not carry error state up to parent steps */
     format('via finishing of flow %s', new.flow_id))
   FROM async.task t
-  WHERE task_id = new.parent_task_id;
+  WHERE 
+    task_id = new.parent_task_id
+    AND Processed IS NULL;
 
   IF NOT FOUND 
   THEN
-    RAISE EXCEPTION 'Unable to find parent_task_id % for flow %',
+    RAISE WARNING 'Unable to find parent_task_id % for flow %',
       new.parent_task_id, new.flow_id;
   END IF;
 
@@ -312,17 +314,14 @@ $$ LANGUAGE SQL;
  */ 
 CREATE OR REPLACE VIEW flow.v_flow_task AS 
   SELECT 
-    t.*,
     (task_data->>'flow_id')::BIGINT AS flow_id,
     task_data->>'node' AS node,
     task_data->'step_arguments' AS step_arguments,
-    flow.is_node(task_data->'step_arguments') AS is_node
+    flow.is_node(task_data->'step_arguments') AS is_node,  
+    t.*
   FROM async.task t
   /* important guard for partial index */
   WHERE (task_data->>'flow_id')::BIGINT IS NOT NULL;
-
-
-
 
 
 

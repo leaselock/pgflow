@@ -73,6 +73,10 @@ CREATE OR REPLACE VIEW flow.v_flow_task_status AS
       WHEN t.processed IS NOT NULL THEN 'Failed'
       WHEN f.processed IS NOT NULL AND t.Consumed IS NULL THEN 'Cancelled'
       WHEN t.task_id IS NULL THEN 'Pending'
+      WHEN t.consumed IS NULL THEN 'Pending'
+      WHEN t.yielded IS NOT NULL 
+        AND is_node 
+        AND concurrency_processed IS NOT NULL THEN 'Running Steps'
       WHEN t.yielded IS NOT NULL THEN 'Running Async'
       WHEN t.consumed IS NOT NULL THEN 'Running'
       ELSE 'Unknown'
@@ -314,3 +318,12 @@ digraph "%s" {
   format(E'%s\nid: %s', f.flow, f.flow_id));
 END;
 $$ LANGUAGE PLPGSQL;
+
+
+
+
+
+
+
+
+
