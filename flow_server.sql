@@ -5,10 +5,12 @@
 
 -- CREATE EXTENSION IF NOT EXISTS pg_cron;
 
-/* describes specific processing chains. yardi_operational, entrata etc. */
+/* Configures processing chain */
 CREATE TABLE flow.flow_configuration
 (
-  flow TEXT PRIMARY KEY
+  flow TEXT PRIMARY KEY,
+  concurrency_group_routine TEXT 
+    CHECK (concurrency_group_routine SIMILAR TO '[a-z]+[a-z_0-9]*.?[a-z_0-9]*')
 );
 
 /* 
@@ -114,7 +116,6 @@ CREATE TABLE flow.mutex
 
 CREATE INDEX ON flow.mutex(right_node);
 
-/* yardi_operational, entrata, etc...one per property? */
 CREATE TABLE flow.flow
 (
   flow_id BIGSERIAL PRIMARY KEY,
@@ -211,6 +212,40 @@ $$
 $$ LANGUAGE SQL IMMUTABLE;
 
 
+/* if there is a routine set in the flow to calculate concurrency group, do so */
+CREATE OR REPLACE FUNCTION flow.concurrency_group(
+  _flow_id BIGINT,
+  _node TEXT,
+  concurrency_group OUT TEXT) RETURNS TEXT AS
+$$
+DECLARE
+  r RECORD;
+  _routine TEXT;
+BEGIN
+  SELECT INTO r 
+    concurrency_group_routine,
+    arguments
+  FROM flow.flow_configuration
+  JOIN flow.flow f USING(flow)
+  WHERE 
+    flow_id = _flow_id
+    AND concurrency_group_routine IS NOT NULL;
+
+  IF NOT FOUND
+  THEN
+    RETURN;
+  END IF;
+
+  _routine := format(
+    'SELECT %s(%s, %s)',
+    quote_ident(r.concurrency_group_routine),
+    _flow_id,
+    quote_literal(_node));
+
+  EXECUTE _routine INTO concurrency_group;
+END;
+$$ LANGUAGE PLPGSQL;
+
 CREATE OR REPLACE FUNCTION flow.configure_callback(
   _callback TEXT,
   _flow_id BIGINT,
@@ -282,7 +317,7 @@ $$
           node,
           step_arguments,
           n.steps_to_flow),
-        NULL
+        flow.concurrency_group(_flow_id, node)
       )::async.task_push_t),
     CASE 
       WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
@@ -721,6 +756,9 @@ $$
 DECLARE 
   r RECORD;
   _flow_configuration JSONB;
+
+  _concurrency_group_routine TEXT 
+    DEFAULT _configuration->>'concurrency_group_routine';
 BEGIN
   CREATE TEMP TABLE tmp_flow (LIKE flow.flow_configuration) ON COMMIT DROP;
   CREATE TEMP TABLE tmp_node (LIKE flow.node) ON COMMIT DROP;
@@ -772,6 +810,10 @@ BEGIN
 
   INSERT INTO flow.flow_configuration SELECT * FROM tmp_flow
     ON CONFLICT DO NOTHING;
+
+  UPDATE flow.flow_configuration SET 
+    concurrency_group_routine = _concurrency_group_routine
+  WHERE flow = _flow_name;
 
   INSERT INTO flow.node (node)
   SELECT t.node FROM tmp_node t
