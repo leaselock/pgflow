@@ -498,6 +498,7 @@ DECLARE
   _flow flow.flow;
   ft flow.v_flow_task;
   _last_step BOOL;
+  _failed_step BOOL;
   
 BEGIN
   SELECT INTO ft * FROM flow.v_flow_task WHERE task_id = new.task_id;
@@ -529,17 +530,31 @@ BEGIN
 
   IF NOT ft.is_node AND _last_step
   THEN
+    IF n.all_steps_must_complete
+    THEN
+      _failed_step := EXISTS (
+        SELECT 1 
+        FROM flow.v_flow_task
+        WHERE
+          flow_id = ft.flow_id
+          AND node = ft.node
+          AND NOT is_node
+          AND failed);
+    ELSE 
+      _failed_step := false;
+    END IF;
+
     /* all steps mark finished. resolve the node which will then cascade 
      * dependency processing.  Node finish status is based this step status.
      */
     PERFORM async.finish_internal(
       array[t.task_id], 
-      CASE WHEN ft.failed AND n.all_steps_must_complete 
+      CASE WHEN _failed_step AND n.all_steps_must_complete 
         THEN 'FAILED'
         ELSE 'FINISHED'
       END::async.finish_status_t, 
       'task complete last step',
-      CASE WHEN ft.failed AND n.all_steps_must_complete 
+      CASE WHEN _failed_step AND n.all_steps_must_complete 
         THEN 'Failed due to steps not completing'
       END)
     FROM flow.v_flow_task t
