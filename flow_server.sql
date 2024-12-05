@@ -584,7 +584,7 @@ BEGIN
      */
     PERFORM async.finish_internal(
       array_agg(task_id),
-      'CANCELED'::async.finish_status_t,
+      'FAILED'::async.finish_status_t,
       'task complete failed',
       format(
         'Failed due to failure of node %s step %s', 
