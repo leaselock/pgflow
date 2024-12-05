@@ -156,8 +156,12 @@ BEGIN
 
   IF NOT FOUND 
   THEN
-    RAISE WARNING 'Unable to find parent_task_id % for flow %',
-      new.parent_task_id, new.flow_id;
+    PERFORM async.log(
+      'WARNING',
+      format(
+        'Unable to find parent_task_id %s for flow %s',
+        new.parent_task_id, 
+        new.flow_id));
   END IF;
 
   RETURN new;
@@ -381,6 +385,9 @@ BEGIN
   RETURNING flow.flow_id INTO create_flow.flow_id;
 
   IF NOT FOUND THEN
+    /* not server logged intentionally since this is a end user invokable 
+     * routine.
+     */
     RAISE EXCEPTION 'Missing flow configuration %', _flow;
   END IF;
 
@@ -510,7 +517,13 @@ BEGIN
 
   IF NOT FOUND 
   THEN
-    RAISE EXCEPTION 'Unable to find requeseted flow_id %', ft.flow_id;
+    /* something or someone nuked the flow record.  Time to punt */
+    PERFORM async.log(
+      'WARNING',
+      format(
+        'Unable to find requeseted flow_id %s during task_complete trigger',
+        ft.flow_id));
+    RETURN NEW;
   END IF;
 
   IF _flow.processed IS NOT NULL
@@ -530,7 +543,7 @@ BEGIN
 
   IF NOT ft.is_node AND _last_step
   THEN
-    IF n.all_steps_must_complete
+    IF (SELECT all_steps_must_complete FROM flow.node n WHERE n.node = ft.node)
     THEN
       _failed_step := EXISTS (
         SELECT 1 
