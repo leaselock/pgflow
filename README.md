@@ -17,7 +17,16 @@ procedure an do. Those procedures can run on the pgflow server itself, but can
 also be run on any server the pgflow server can reach with dblink.
 
 ### Node
+A node is a dependency organized step in a flow.  By default, the name of the 
+node itself is a stored procedure that is invoked.  
+
+
 ### Step
+A node can also contain a set of steps, which will run after the node routine is 
+run (if any).  The steps are not designed to run in any particular order, but 
+must each contain one or more arguements that will be used to differentiate them
+from one another.
+
 ### Callback Routine
 
 ## Installation
