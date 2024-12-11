@@ -11,6 +11,11 @@
 ## Concepts
 * pgflow defines the following concepts:
 ### Flow
+A flow is a sequences set of processes to run in a DAG.  Those proceses are
+always implemented in stored procedures, but are allowed to do anything a stored
+procedure an do. Those procedures can run on the pgflow server itself, but can
+also be run on any server the pgflow server can reach with dblink.
+
 ### Node
 ### Step
 ### Callback Routine
