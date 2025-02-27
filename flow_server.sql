@@ -56,7 +56,15 @@ CREATE TABLE flow.node
   /* overrides target asynchronous flag.  Set true when steps are configured
    * in the node locally.  If the node target is synchronous, this does nothing.
    */
-  synchronous BOOL DEFAULT FALSE
+  synchronous BOOL DEFAULT FALSE,
+
+  /* nodes and steps can be configured to have a maximum run time.  If not set,
+   * the target timeout will be checked and finally the async.control timneout
+   * is used to establish maximum run time.
+   */
+  node_timeout INTERVAL,
+
+  step_timeout INTERVAL
 
 );
 
@@ -301,7 +309,6 @@ CREATE OR REPLACE FUNCTION flow.push_tasks(
   _run_type async.task_run_type_t DEFAULT 'EXECUTE',
   _source TEXT DEFAULT NULL) RETURNS VOID AS 
 $$
-
   SELECT
     async.push_tasks(array_agg(
       (
@@ -321,7 +328,11 @@ $$
           node,
           step_arguments,
           n.steps_to_flow),
-        flow.concurrency_group(_flow_id, node)
+        flow.concurrency_group(_flow_id, node),
+        CASE WHEN flow.is_node(t.step_arguments) 
+          THEN n.node_timeout
+          ELSE n.step_timeout 
+        END
       )::async.task_push_t),
     CASE 
       WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
@@ -861,7 +872,9 @@ BEGIN
     routine = t.routine,
     node_routine = t.node_routine,
     step_routine = t.step_routine,
-    synchronous = COALESCE(t.synchronous, n.synchronous)
+    synchronous = COALESCE(t.synchronous, n.synchronous),
+    node_timeout = t.node_timeout,
+    step_timeout = t.step_timeout
   FROM tmp_node t
   WHERE t.node = n.node;
 
