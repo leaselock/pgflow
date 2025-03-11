@@ -677,6 +677,8 @@ CREATE OR REPLACE TRIGGER on_flow_task_complete
      * ...task is completing and...
      */
     new.processed IS NOT NULL
+
+    AND new.tracked IS DISTINCT FROM FALSE
     /* ...this is a task attached to flow  and ... */
     AND (new.task_data->>'flow_id') IS NOT NULL
     /* this is not a failure that itself is trigger fired */    
@@ -775,6 +777,9 @@ CREATE OR REPLACE TRIGGER on_flow_check_node_steps
      * ...task is completing and...
      */
     new.processed IS NOT NULL
+
+    AND new.tracked IS DISTINCT FROM FALSE
+
     /* ...this is a task attached to flow  and ... */
     AND (new.task_data->>'flow_id') IS NOT NULL
 
