@@ -75,8 +75,7 @@ CREATE OR REPLACE VIEW flow.v_flow_task_status AS
       WHEN t.task_id IS NULL THEN 'Pending'
       WHEN t.consumed IS NULL THEN 'Pending'
       WHEN t.yielded IS NOT NULL 
-        AND is_node 
-        AND concurrency_processed IS NOT NULL THEN 'Running Steps'
+        AND is_node THEN 'Running Steps'
       WHEN t.yielded IS NOT NULL THEN 'Running Async'
       WHEN t.consumed IS NOT NULL THEN 'Running'
       ELSE 'Unknown'

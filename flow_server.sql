@@ -332,7 +332,9 @@ $$
         CASE WHEN flow.is_node(t.step_arguments) 
           THEN n.node_timeout
           ELSE n.step_timeout 
-        END
+        END,
+        /* by default, track yieled tasks for steps but not nodes */
+        NOT flow.is_node(t.step_arguments)
       )::async.task_push_t),
     CASE 
       WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
@@ -760,7 +762,6 @@ BEGIN
     new.failed := NULL;
     new.processing_error := NULL;
     new.finish_status = 'YIELDED';
-    new.concurrency_processed = now();
     new.source := 'step processing';
   END IF;
 
