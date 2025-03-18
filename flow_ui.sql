@@ -103,7 +103,9 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     COUNT(*) FILTER (WHERE NOT t.Failed) AS count_finished_nodes,
     COUNT(*) FILTER (WHERE t.Failed 
       OR (t.task_id IS NULL AND f.Processed IS NOT NULL)) AS count_failed_nodes,
-    f.arguments
+    f.arguments,
+    any_value(processing_error ORDER BY t.Processed) FILTER (WHERE failed)
+      AS first_error
   FROM flow.flow f
   LEFT JOIN flow.flow_node n USING(flow)
   LEFT JOIN flow.v_flow_task t ON
