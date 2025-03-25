@@ -93,7 +93,7 @@ CREATE OR REPLACE VIEW flow.v_flow_task_status AS
 
   
 
-CREATE OR REPLACE VIEW flow.v_flow_status AS
+CREATE OR REPLACE VIEW flow.v_flow_status_internal AS
   SELECT
     f.flow_id,
     f.flow,
@@ -113,6 +113,43 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     AND n.node = t.node 
     AND flow.is_node(t.step_arguments)
   GROUP BY 1,2;
+
+CREATE OR REPLACE VIEW flow.v_flow_status AS
+  SELECT
+    f.flow_id,
+    f.flow,
+    CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
+    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    count_nodes::BIGINT,
+    count_finished_nodes::BIGINT,
+    count_failed_nodes::BIGINT,
+    f.arguments,
+    first_error
+  FROM flow.flow f
+  WHERE count_nodes IS NOT NULL
+  UNION ALL SELECT
+    flow_id,
+    flow,
+    CASE WHEN Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
+    interval_pretty(COALESCE(processed, now()) - created) AS run_time,
+    (i->>'count_nodes')::BIGINT,
+    (i->>'count_finished_nodes')::BIGINT,
+    (i->>'count_failed_nodes')::BIGINT,
+    arguments,
+    i->>'first_error'
+  FROM 
+  (
+    SELECT 
+      f.*, 
+      (
+        SELECT to_json(i)
+        FROM flow.v_flow_status_internal i
+        WHERE flow_id = f.flow_id      
+      ) i
+    FROM flow.flow f
+    WHERE count_nodes IS NULL
+  ) q;
+
 
 
 CREATE OR REPLACE FUNCTION flow.flows(

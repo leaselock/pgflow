@@ -138,8 +138,22 @@ CREATE TABLE flow.flow
   parent_task_id BIGINT REFERENCES async.task ON DELETE CASCADE,
 
   /* if non-null, nodes not in this list will not be processed. */
-  only_these_nodes TEXT[]
+  only_these_nodes TEXT[],
 
+  /* if created from a step, parent_flow_id is here for purposes of fast
+   * joining.
+   */
+  parent_flow_id BIGINT,
+
+  /* cache a few variables in the flow itself when processed to speed lookups */
+  count_nodes INT,
+
+  count_finished_nodes INT,
+
+  count_failed_nodes INT,
+
+  first_error TEXT
+  
 );
 
 CREATE INDEX ON flow.flow(flow);
@@ -147,6 +161,8 @@ CREATE INDEX ON flow.flow(parent_task_id);
 
 CREATE OR REPLACE FUNCTION flow.finish_parent() RETURNS TRIGGER AS
 $$
+DECLARE 
+  s RECORD;
 BEGIN
   IF old.processed IS NOT NULL
   THEN
@@ -172,15 +188,22 @@ BEGIN
         new.flow_id));
   END IF;
 
+  SELECT INTO s * FROM flow.v_flow_status_internal WHERE flow_id = new.flow_id;
+
+  new.count_nodes = s.count_nodes;
+  new.count_finished_nodes = s.count_finished_nodes;
+  new.first_error = s.first_error;
+  new.count_failed_nodes = s.count_failed_nodes;
+
+
   RETURN new;
 END;
 $$ LANGUAGE PLPGSQL;
 
 CREATE OR REPLACE TRIGGER on_flow_update
-  AFTER INSERT OR UPDATE ON flow.flow
+  BEFORE INSERT OR UPDATE ON flow.flow
   FOR EACH ROW WHEN (
     new.processed IS NOT NULL
-    AND new.parent_task_id IS NOT NULL
   )  
   EXECUTE PROCEDURE flow.finish_parent();
 
@@ -387,13 +410,17 @@ CREATE OR REPLACE FUNCTION flow.create_flow(
   flow_id OUT BIGINT) RETURNS BIGINT AS
 $$
 BEGIN
-  INSERT INTO flow.flow(flow, arguments, parent_task_id, only_these_nodes)
+  INSERT INTO flow.flow(flow, 
+    arguments, parent_task_id, only_these_nodes, parent_flow_id)
   SELECT 
     _flow,
     _arguments,
     _parent_task_id,
-    _only_these_nodes
+    _only_these_nodes,
+    t.flow_id
   FROM flow.flow_configuration
+  LEFT JOIN flow.v_flow_task t ON
+    t.task_id = _parent_task_id
   WHERE flow = _flow
   RETURNING flow.flow_id INTO create_flow.flow_id;
 
