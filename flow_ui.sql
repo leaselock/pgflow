@@ -104,7 +104,13 @@ CREATE OR REPLACE VIEW flow.v_flow_status_internal AS
     COUNT(*) FILTER (WHERE t.Failed 
       OR (t.task_id IS NULL AND f.Processed IS NOT NULL)) AS count_failed_nodes,
     f.arguments,
-    any_value(processing_error ORDER BY t.Processed) FILTER (WHERE failed)
+    any_value(processing_error ORDER BY t.Processed) 
+      FILTER (
+        WHERE 
+          failed 
+          AND processing_error NOT LIKE 'Failed due to%'
+          AND length(processing_error) > 0
+        )
       AS first_error
   FROM flow.flow f
   LEFT JOIN flow.flow_node n USING(flow)

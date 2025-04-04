@@ -546,6 +546,7 @@ DECLARE
   ft flow.v_flow_task;
   _last_step BOOL;
   _failed_step BOOL;
+  _first_failure TEXT;
   
 BEGIN
   SELECT INTO ft * FROM flow.v_flow_task WHERE task_id = new.task_id;
@@ -608,7 +609,7 @@ BEGIN
       END::async.finish_status_t, 
       'task complete last step',
       CASE WHEN _failed_step AND n.all_steps_must_complete 
-        THEN 'Failed due to steps not completing'
+        THEN format('Steps did not complete from %', ft.processing_error)
       END)
     FROM flow.v_flow_task t
     JOIN flow.node n USING(node)
@@ -627,9 +628,10 @@ BEGIN
       'FAILED'::async.finish_status_t,
       'task complete failed',
       format(
-        'Failed due to failure of node %s step %s', 
+        'Failed due to failure of node %s step %s via %s', 
         ft.node, 
-        ft.step_arguments))
+        ft.step_arguments,
+        ft.processing_error))
     FROM flow.v_flow_task t
     JOIN flow.node n ON n.node = ft.node
     WHERE 
