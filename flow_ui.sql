@@ -1,6 +1,24 @@
 
 /* Views and functions to support flow administration from UI */
 
+CREATE OR REPLACE FUNCTION interval_pretty(i INTERVAL) RETURNS TEXT AS
+$$
+  SELECT
+    CASE
+      WHEN d > 0 THEN format('%sd %sh %sm %ss', d, h, m, s)
+      WHEN h > 0 THEN format('%sh %sm %ss', h, m, s)
+      WHEN m > 0 THEN format('%sm %ss', m, s)
+      ELSE format('%ss', s)
+    END
+  FROM
+  (
+    SELECT
+      extract('days' FROM i) d,
+      extract('hours' FROM i) h,
+      extract('minutes' FROM i) m,
+      round(extract('seconds' FROM i)::numeric, 1) s
+  ) q
+$$ LANGUAGE SQL STRICT;
 
 /* get flow data and status */
 
