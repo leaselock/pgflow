@@ -609,7 +609,7 @@ BEGIN
       END::async.finish_status_t, 
       'task complete last step',
       CASE WHEN _failed_step AND n.all_steps_must_complete 
-        THEN format('Steps did not complete from %', ft.processing_error)
+        THEN format('Steps did not complete from %s', ft.processing_error)
       END)
     FROM flow.v_flow_task t
     JOIN flow.node n USING(node)
