@@ -45,7 +45,8 @@ CREATE OR REPLACE VIEW flow.v_flow_node_status AS
     COUNT(*) FILTER (WHERE s.Status = 'Pending') AS steps_pending,
     COUNT(*) FILTER (WHERE s.Status IN ('Running', 'Running Async')) AS steps_running,
     COUNT(*) FILTER (WHERE s.Status = 'Finished') AS steps_finished,
-    COUNT(*) FILTER (WHERE s.Status = 'Failed') AS steps_failed
+    COUNT(*) FILTER (WHERE s.Status = 'Failed') AS steps_failed,
+    all_steps_must_complete
   FROM flow.flow f
   JOIN flow.flow_node n USING(flow)
   JOIN flow.node n2 USING(node)
@@ -72,7 +73,8 @@ CREATE OR REPLACE VIEW flow.v_flow_node_status AS
   ) s ON 
     s.flow_id = f.flow_id   
     AND s.node = n.node
-  GROUP BY 1,2,3, n2.target, t.finish_status, t.processed, t.yielded, t.consumed, t.task_id;
+  GROUP BY 1,2,3, n2.target, t.finish_status, t.processed, t.yielded, 
+    t.consumed, t.task_id, all_steps_must_complete;
 
 
 CREATE OR REPLACE VIEW flow.v_flow_task_status AS
@@ -270,7 +272,8 @@ BEGIN
       p.continue_on_failure,
       steps_overview,
       runtime,
-      status
+      status,
+      NOT all_steps_must_complete AND steps_overview != '' AS partial_steps
     FROM
     (
       SELECT
@@ -301,7 +304,8 @@ BEGIN
               steps_failed)
           ELSE ''
         END AS steps_overview,
-        status
+        status,
+        all_steps_must_complete
       FROM flow.v_flow_node_status
     ) n
     LEFT JOIN
@@ -329,7 +333,15 @@ BEGIN
       format('%s -> %s%s',
         replace(parent, '.', '_'),
         replace(node, '.', '_'),
-        CASE WHEN continue_on_failure THEN ' [arrowhead=empty]' END), E'\n'
+        CASE 
+          WHEN continue_on_failure AND partial_steps
+            THEN ' [arrowhead=empty, dir=both, arrowtail = "invempty"]'
+          WHEN continue_on_failure AND NOT partial_steps
+            THEN ' [arrowhead=empty]'
+          WHEN NOT continue_on_failure AND partial_steps
+            THEN ' [dir=both, arrowtail = "invempty"]'
+          ELSE ''
+        END), E'\n'
         ORDER BY parent, node),
     string_agg(
       flow.graphviz_node(
@@ -344,10 +356,10 @@ BEGIN
   FROM
   (
     SELECT DISTINCT 
-      parent, node, target, color, continue_on_failure, steps_overview, runtime, status
+      parent, node, target, color, continue_on_failure, steps_overview, runtime, status, partial_steps
     FROM d 
     UNION ALL SELECT DISTINCT 
-      node, 'end', target, color, false, steps_overview, runtime, status
+      node, 'end', target, color, false, steps_overview, runtime, status, partial_steps
     FROM d
     WHERE Child = 'end'
   ) q;
@@ -369,8 +381,8 @@ digraph "%s" {
 
   legend->flow_pending [arrowhead=empty label="  run on fail"];
   flow_pending->flow_running [label="  fail on fail"];
-  flow_running->flow_finished;
-  flow_running->flow_failed;
+  flow_running->flow_finished ;
+  flow_running->flow_failed [label="steps may fail", dir=both, arrowtail = "invempty"];
 
 }$q$,
   format('%s/%s', f.flow, f.flow_id),
