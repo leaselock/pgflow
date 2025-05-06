@@ -325,6 +325,9 @@ $$ LANGUAGE SQL IMMUTABLE;
  * task table, but this introduces race conditions crossing the asynchronous
  * call boundary, for example task might compute before the local transaction
  * resolves.
+ *
+ * XXX: needs to trap error and fail flow if failed on unique constraint --
+ * can happen if task cancels.
  */
 CREATE OR REPLACE FUNCTION flow.push_tasks(
   _flow_id BIGINT,
