@@ -20,6 +20,20 @@ $$
   ) q
 $$ LANGUAGE SQL STRICT;
 
+/* list of flows and their configuration */
+CREATE OR REPLACE VIEW flow.v_flow_configuration AS
+  SELECT 
+    flow,
+    concurrency_group_routine,
+    now() AS last_execution_time,
+    false AS last_execution_success,
+    'RUN' AS flow_concurrency_control,  /* RUN / QUEUE / BLOCK */
+    1 AS last_execution_flow_id,
+    1 AS count_flows_running,
+    1 AS count_flows_pending,
+    'stuff happened!'::TEXT AS last_error_message
+  FROM flow.flow_configuration;
+
 /* get flow data and status */
 
 CREATE OR REPLACE VIEW flow.v_flow_node_status AS
