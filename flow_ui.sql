@@ -20,22 +20,7 @@ $$
   ) q
 $$ LANGUAGE SQL STRICT;
 
-/* list of flows and their configuration */
-CREATE OR REPLACE VIEW flow.v_flow_configuration AS
-  SELECT 
-    flow,
-    concurrency_group_routine,
-    now() AS last_execution_time,
-    false AS last_execution_success,
-    'RUN' AS flow_concurrency_control,  /* RUN / QUEUE / BLOCK */
-    1 AS last_execution_flow_id,
-    1 AS count_flows_running,
-    1 AS count_flows_pending,
-    'stuff happened!'::TEXT AS last_error_message
-  FROM flow.flow_configuration;
-
 /* get flow data and status */
-
 CREATE OR REPLACE VIEW flow.v_flow_node_status AS
   SELECT 
     f.flow_id,
@@ -189,6 +174,37 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     FROM flow.flow f
     WHERE count_nodes IS NULL
   ) q;
+
+/* list of flows and their configuration */
+DROP VIEW IF EXISTS flow.v_flow_configuration;
+CREATE OR REPLACE VIEW flow.v_flow_configuration AS
+  SELECT 
+    fc.flow,
+    concurrency_group_routine,
+    f.created AS last_execution_time,
+    CASE 
+      WHEN f.processed IS NULL THEN NULL
+      WHEN f.count_failed_nodes = 0 THEN true
+      ELSE false
+    END AS last_execution_success,
+    'RUN' AS flow_concurrency_control,  /* RUN / QUEUE / BLOCK */
+    f.flow_id AS last_execution_flow_id,
+    fl.count_flows_running::INT,
+    0 AS count_flows_pending,
+    fs.first_error AS last_error_message
+  FROM flow.flow_configuration fc
+  LEFT JOIN
+  (
+    SELECT 
+      flow, 
+      max(flow_id) AS flow_id,
+      count(*) FILTER(WHERE processed IS NULL) AS count_flows_running
+    FROM flow.flow
+    GROUP BY 1
+  ) fl USING(flow)
+  LEFT JOIN flow.flow f USING(flow_id)
+  LEFT JOIN flow.v_flow_status fs USING(flow_id);
+
 
 
 
