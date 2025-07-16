@@ -345,7 +345,7 @@ BEGIN
       LEFT JOIN flow.v_flow_task t ON
         d.flow_id = t.flow_id
         AND d.parent = t.node
-        AND NOT flow.is_node(t.step_arguments)
+        AND flow.is_node(t.step_arguments)
     ) p ON n.node = p.child AND n.flow_id = p.flow_id
     LEFT JOIN
     (
@@ -354,7 +354,7 @@ BEGIN
       LEFT JOIN flow.v_flow_task t ON
         d.flow_id = t.flow_id
         AND d.child = t.node      
-        AND NOT flow.is_node(t.step_arguments)
+        AND flow.is_node(t.step_arguments)
     ) c ON n.node = c.parent AND n.flow_id = c.flow_id
     WHERE n.flow_id = _flow_id
   )
