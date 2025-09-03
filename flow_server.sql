@@ -178,16 +178,6 @@ BEGIN
     task_id = new.parent_task_id
     AND Processed IS NULL;
 
-  IF NOT FOUND 
-  THEN
-    PERFORM async.log(
-      'WARNING',
-      format(
-        'Unable to find parent_task_id %s for flow %s',
-        new.parent_task_id, 
-        new.flow_id));
-  END IF;
-
   SELECT INTO s * FROM flow.v_flow_status_internal WHERE flow_id = new.flow_id;
 
   new.count_nodes = s.count_nodes;
@@ -320,6 +310,23 @@ $$
     'step_arguments', _step_arguments);
 $$ LANGUAGE SQL IMMUTABLE;
 
+
+/* extends the async.task to have the json stored elements be produced as 
+ * columns.  They are likely going to be indexed, so it's good to formalize
+ * access to them.
+ */ 
+CREATE OR REPLACE VIEW flow.v_flow_task AS 
+  SELECT 
+    (task_data->>'flow_id')::BIGINT AS flow_id,
+    task_data->>'node' AS node,
+    task_data->'step_arguments' AS step_arguments,
+    flow.is_node(task_data->'step_arguments') AS is_node,  
+    t.*
+  FROM async.task t
+  /* important guard for partial index */
+  WHERE (task_data->>'flow_id')::BIGINT IS NOT NULL;
+
+
 /* Creates and sends tasks to async for processing.  It's tempting to locally 
  * record tasks for tracking purposes to simplify dependency lookups over the 
  * task table, but this introduces race conditions crossing the asynchronous
@@ -375,6 +382,14 @@ $$
       node,
       step_arguments
     FROM unnest(_tasks) t
+    WHERE NOT EXISTS (
+      SELECT 1 
+      FROM flow.v_flow_task vt
+      WHERE 
+        vt.flow_id = _flow_id
+        AND vt.node = t.node
+        AND vt.step_arguments = t.step_arguments
+    )
   ) t
   JOIN flow.node n USING(node)
   WHERE f.flow_id = _flow_id
@@ -386,20 +401,7 @@ $$
 $$ LANGUAGE SQL;
 
 
-/* extends the async.task to have the json stored elements be produced as 
- * columns.  They are likely going to be indexed, so it's good to formalize
- * access to them.
- */ 
-CREATE OR REPLACE VIEW flow.v_flow_task AS 
-  SELECT 
-    (task_data->>'flow_id')::BIGINT AS flow_id,
-    task_data->>'node' AS node,
-    task_data->'step_arguments' AS step_arguments,
-    flow.is_node(task_data->'step_arguments') AS is_node,  
-    t.*
-  FROM async.task t
-  /* important guard for partial index */
-  WHERE (task_data->>'flow_id')::BIGINT IS NOT NULL;
+
 
 
 
@@ -576,6 +578,9 @@ BEGIN
     RETURN NEW;
   END IF;
 
+  /* XXX: it may be better to verify parent node is still running before 
+   * checking this for performance reasons.
+   */
   _last_step := NOT ft.is_node AND NOT EXISTS (
       SELECT 1 FROM flow.v_flow_task t
       WHERE 
@@ -619,6 +624,7 @@ BEGIN
     WHERE
       flow_id = ft.flow_id
       AND node = ft.node
+      AND processed IS NULL
       AND is_node;      
   ELSEIF NOT ft.is_node AND ft.failed 
   THEN
@@ -667,7 +673,7 @@ BEGIN
     THEN
       PERFORM flow.push_tasks(
         ft.flow_id,
-        array_agg(t),
+        array_agg(DISTINCT t),
         run_type,
         _source := format(
           'node complete (from task_id %s)',
@@ -825,6 +831,21 @@ CREATE OR REPLACE TRIGGER on_flow_check_node_steps
   EXECUTE PROCEDURE flow.check_node_steps();
 
 
+SELECT async.push_startup_routine('flow.async_startup()');
+
+/* run clean up processes when orchestator starts */
+CREATE OR REPLACE PROCEDURE flow.async_startup() AS
+$$
+BEGIN
+  PERFORM async.log('Performing flow cleanup');
+
+  PERFORM flow.cancel(flow_id) 
+  FROM flow.flow 
+  WHERE flow.processed IS NULL;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 CREATE OR REPLACE FUNCTION flow.configure_flow(
   _flow_name TEXT,
   _configuration JSONB,
@@ -837,6 +858,9 @@ DECLARE
   _concurrency_group_routine TEXT 
     DEFAULT _configuration->>'concurrency_group_routine';
 BEGIN
+  /* ensure async start up process is installed. */
+  PERFORM async.push_startup_routine('flow.async_startup()');
+
   CREATE TEMP TABLE tmp_flow (LIKE flow.flow_configuration) ON COMMIT DROP;
   CREATE TEMP TABLE tmp_node (LIKE flow.node) ON COMMIT DROP;
 
