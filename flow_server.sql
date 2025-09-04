@@ -159,6 +159,39 @@ CREATE TABLE flow.flow
 CREATE INDEX ON flow.flow(flow);
 CREATE INDEX ON flow.flow(parent_task_id);
 
+
+CREATE TABLE flow.dependency
+(
+  flow_id INT REFERENCES flow.flow ON DELETE CASCADE,
+  parent TEXT REFERENCES flow.node ON DELETE CASCADE,
+  child TEXT REFERENCES flow.node ON DELETE CASCADE,
+
+  continue_on_failure BOOL,
+
+  PRIMARY KEY(flow_id, parent, child)
+);
+
+CREATE INDEX ON flow.dependency(child, flow_id);
+
+CREATE TYPE flow.task_wrapper_t AS
+(
+  node TEXT,
+  step_arguments JSONB
+);
+
+
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
+  ( 
+    (((task_data)->>'flow_id')::BIGINT),
+    ((task_data)->>'node'),
+    ((task_data)->'step_arguments')
+  )
+WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
+
+\endif
+
 CREATE OR REPLACE FUNCTION flow.finish_parent() RETURNS TRIGGER AS
 $$
 DECLARE 
@@ -196,39 +229,6 @@ CREATE OR REPLACE TRIGGER on_flow_update
     new.processed IS NOT NULL
   )  
   EXECUTE PROCEDURE flow.finish_parent();
-
-
-CREATE TABLE flow.dependency
-(
-  flow_id INT REFERENCES flow.flow ON DELETE CASCADE,
-  parent TEXT REFERENCES flow.node ON DELETE CASCADE,
-  child TEXT REFERENCES flow.node ON DELETE CASCADE,
-
-  continue_on_failure BOOL,
-
-  PRIMARY KEY(flow_id, parent, child)
-);
-
-CREATE INDEX ON flow.dependency(child, flow_id);
-
-CREATE TYPE flow.task_wrapper_t AS
-(
-  node TEXT,
-  step_arguments JSONB
-);
-
-
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
-  ( 
-    (((task_data)->>'flow_id')::BIGINT),
-    ((task_data)->>'node'),
-    ((task_data)->'step_arguments')
-  )
-WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
-
-\endif
 
 
 CREATE OR REPLACE FUNCTION flow.is_node(_step_arguments JSONB) RETURNS BOOL AS
