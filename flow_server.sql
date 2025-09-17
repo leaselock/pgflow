@@ -1102,7 +1102,7 @@ BEGIN
     GROUP BY fn.node
   ) q WHERE 
     fn.node = q.node
-    AND fn.flow = flow;
+    AND fn.flow = _flow;
 END;
 $$ LANGUAGE PLPGSQL;
 
