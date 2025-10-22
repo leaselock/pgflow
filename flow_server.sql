@@ -34,7 +34,7 @@ CREATE TABLE flow.node
   /* use this as callback if step (priority over 'routine') */
   step_routine TEXT DEFAULT NULL,
 
-  priority INT DEFAULT 0,
+  priority INT,
 
   /* if set true, any step failing will immedaitely cause this node to stop 
    * processing (and cancel any work if there is any )
@@ -152,7 +152,10 @@ CREATE TABLE flow.flow
 
   count_failed_nodes INT,
 
-  first_error TEXT
+  first_error TEXT,
+
+  /* tasks run at this priority. overrides node priority if not null */
+  force_priority INT
   
 );
 
@@ -277,7 +280,8 @@ CREATE OR REPLACE FUNCTION flow.configure_callback(
   _flow TEXT,
   _node TEXT,
   _step_arguments JSONB,
-  _steps_to_flow TEXT) RETURNS TEXT AS
+  _steps_to_flow TEXT,
+  _priority INT) RETURNS TEXT AS
 $$
   SELECT 
     CASE WHEN _callback = '' THEN ''
@@ -292,9 +296,10 @@ $$
     END
   WHERE _steps_to_flow IS NULL OR flow.is_node(_step_arguments)
   UNION ALL SELECT format(
-    'SELECT flow.create_flow(%s, %s::jsonb, _parent_task_id := ##flow.TASK_ID##)',
+    'SELECT flow.create_flow(%s, %s::jsonb, _parent_task_id := ##flow.TASK_ID##, _force_priority := %s)',
     quote_literal(_steps_to_flow),
-    quote_literal(_step_arguments))
+    quote_literal(_step_arguments),
+    quote_nullable(_priority))
   WHERE NOT (_steps_to_flow IS NULL OR flow.is_node(_step_arguments))
 $$ LANGUAGE SQL IMMUTABLE;
 
@@ -350,7 +355,7 @@ $$
           t.node,
           t.step_arguments),
         n.target,
-        n.priority,
+        COALESCE(f.force_priority, n.priority),
         flow.configure_callback(
           CASE WHEN flow.is_node(t.step_arguments) 
             THEN COALESCE(n.node_routine, n.routine, n.node)
@@ -360,7 +365,8 @@ $$
           flow,
           node,
           step_arguments,
-          n.steps_to_flow),
+          n.steps_to_flow,
+          COALESCE(f.force_priority, n.priority)),
         flow.concurrency_group(_flow_id, node),
         CASE WHEN flow.is_node(t.step_arguments) 
           THEN n.node_timeout
@@ -412,17 +418,22 @@ CREATE OR REPLACE FUNCTION flow.create_flow(
   _add_parents BOOL DEFAULT FALSE, /* XXX: not implemented */
   _add_children BOOL DEFAULT FALSE, /* XXX: not implemented */
   _parent_task_id BIGINT DEFAULT NULL,
+  _force_priority INT DEFAULT NULL, /* run all nodes at this priority */
   flow_id OUT BIGINT) RETURNS BIGINT AS
 $$
 BEGIN
   INSERT INTO flow.flow(flow, 
-    arguments, parent_task_id, only_these_nodes, parent_flow_id)
+    arguments, parent_task_id, only_these_nodes, parent_flow_id, force_priority)
   SELECT 
     _flow,
     _arguments,
     _parent_task_id,
     _only_these_nodes,
-    t.flow_id
+    t.flow_id,
+    /* force priority can be directly specfified, or inherited from the 
+     * creating parent step if there is one.
+     */
+    COALESCE(_force_priority, t.priority)
   FROM flow.flow_configuration
   LEFT JOIN flow.v_flow_task t ON
     t.task_id = _parent_task_id
@@ -1004,19 +1015,6 @@ $$
 $$ LANGUAGE SQL;
 
 
-CREATE OR REPLACE FUNCTION flow.flow_from_step(
-  _flow TEXT,
-  _step flow.v_flow_task) RETURNS VOID AS
-$$
-  SELECT 
-    flow.create_flow(
-      _flow,
-      f.arguments || _step.step_arguments,
-      _parent_task_id := _step.task_id)
-  FROM flow.node n
-  JOIN flow.flow f ON f.flow_id = _step.flow_id
-  WHERE n.node = _step.node;
-$$ LANGUAGE SQL;
 
 /* walks dependencies collecting facts as it goes. used to support configure
  * time processing, cylic checks, and other dependency analysis that will 
