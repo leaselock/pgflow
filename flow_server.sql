@@ -497,6 +497,12 @@ BEGIN
     SELECT 1 FROM flow.v_flow_task t
     WHERE t.flow_id = create_flow.flow_id)
   THEN
+    PERFORM async.log(
+      'WARNING', 
+      format(
+        'Auto finishing empty flow %s',
+        create_flow.flow_id));
+
     UPDATE flow.flow f SET processed = clock_timestamp()
     WHERE f.flow_id = create_flow.flow_id;
   END IF;
@@ -531,7 +537,7 @@ $$
     array_agg(d2.parent) FILTER (WHERE t.processed IS NULL)
   FROM flow.dependency d
   JOIN flow.flow f ON f.flow_id = _flow_id
-  JOIN flow.node n ON d.child = n.Node
+  JOIN flow.node n ON d.child = n.node
   JOIN flow.dependency d2 ON 
     d2.flow_id = d.flow_id
     AND d2.child = d.child
@@ -706,10 +712,37 @@ BEGIN
     SELECT 1 FROM flow.v_flow_task 
     WHERE 
       flow_id = ft.flow_id
-      AND processed IS NULL)
+      AND processed IS NULL) 
   THEN
-    UPDATE flow.flow SET processed = clock_timestamp() 
-    WHERE flow_id = ft.flow_id;
+    /* ensure there are no eligible tasks for any node that is a sibling 
+     * of this node that has eligible tasks to prevent this node from closing
+     * the flow before it has a chance to kick out its tasks.  This can happen
+     * of the tasks complete at the same call to async.finish().
+     */
+    IF NOT EXISTS
+    (
+      SELECT * FROM 
+      (
+        SELECT (flow.node_child_dependencies(p.flow_id, c.child)).eligible
+        FROM flow.dependency p
+        JOIN flow.dependency c ON
+          c.parent = p.parent
+          AND p.flow_id = c.flow_id
+        WHERE 
+          p.flow_id = ft.flow_id
+          AND p.child = ft.node
+          AND c.child != p.child
+      ) WHERE eligible
+    )
+    THEN
+      PERFORM async.log(
+        format(
+          'Finishing flow %s on task complete',
+          ft.flow_id));
+
+      UPDATE flow.flow SET processed = clock_timestamp() 
+      WHERE flow_id = ft.flow_id;
+    END IF;
   END IF;
 
   RETURN new;

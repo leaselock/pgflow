@@ -179,6 +179,8 @@ BEGIN
     RETURN;
   END IF; 
 
+  PERFORM async.log(format('Canceling flow %s', _flow_id));
+
   SELECT INTO _task_ids array_agg(task_id) 
   FROM flow.v_flow_task 
   WHERE 
