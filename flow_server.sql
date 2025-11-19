@@ -713,6 +713,7 @@ BEGIN
     WHERE 
       flow_id = ft.flow_id
       AND processed IS NULL) 
+    AND ft.is_node
   THEN
     /* ensure there are no eligible tasks for any node that is a sibling 
      * of this node that has eligible tasks to prevent this node from closing
