@@ -148,14 +148,10 @@ BEGIN
   END IF; 
 
   PERFORM async.finish(
-    array[task_id],
+    array[_args.task_id],
     CASE WHEN _failed THEN 'FAILED' ELSE 'FINISHED' END::async.finish_status_t,
-      _error_message)
-  FROM flow.v_flow_task
-  WHERE 
-    flow_id = _args.flow_id
-    AND node = _args.node
-    AND step_arguments = _args.step_arguments;
+      _error_message);
+  
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -277,6 +273,8 @@ BEGIN
         AS R(V INT);
     RETURN;
   END IF; 
+
+  /* XXX: only the orchestrator can directly adjust tasks */
 
   /* do not prioritize flows that are finished */
   PERFORM 1 FROM flow.flow WHERE flow_id = _flow_id AND processed IS NULL;

@@ -184,7 +184,10 @@ CREATE TYPE flow.task_wrapper_t AS
 
 
 
-
+/* 
+ * extend the task table so that the same exact step can not be implemented 
+ * two or more times in the same flow.
+ */
 CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
   ( 
     (((task_data)->>'flow_id')::BIGINT),
