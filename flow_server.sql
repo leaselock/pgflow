@@ -741,8 +741,10 @@ BEGIN
     THEN
       PERFORM async.log(
         format(
-          'Finishing flow %s on task complete',
-          ft.flow_id));
+          'Finishing flow %s on task complete of task %s node %s',
+          ft.flow_id,
+          ft.task_id,
+          ft.node));
 
       UPDATE flow.flow SET processed = clock_timestamp() 
       WHERE flow_id = ft.flow_id;
