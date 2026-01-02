@@ -1,9 +1,28 @@
 /* extends async.sql into dependency chain processing and directly interacts
  * with its structures.
  */
-\if :bootstrap
+DO
+$bootstrap$
+BEGIN
 
--- CREATE EXTENSION IF NOT EXISTS pg_cron;
+BEGIN
+  PERFORM 1 FROM async.client_control;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Please install async client library first';
+END;
+
+BEGIN
+  PERFORM 1 FROM flow.arguments LIMIT 0;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Please install flow client library first';
+END;
+
+BEGIN
+  PERFORM 1 FROM flow.flow_configuration LIMIT 0;
+  RETURN;
+EXCEPTION WHEN undefined_table THEN NULL;
+END;
+
 
 /* Configures processing chain */
 CREATE TABLE flow.flow_configuration
@@ -16,7 +35,7 @@ CREATE TABLE flow.flow_configuration
 /* 
  * organizes work in dependency terms against a thing as instanced in the flow 
  * itself. Can have work in itself (which runs first) as well as underlying 
- * concurrent.  work is complete when all underlying stpes are complete.
+ * concurrent.  work is complete when all underlying steps are complete.
  */
 CREATE TABLE flow.node
 (
@@ -161,6 +180,7 @@ CREATE TABLE flow.flow
 
 CREATE INDEX ON flow.flow(flow);
 CREATE INDEX ON flow.flow(parent_task_id);
+CREATE INDEX ON flow.flow(flow_id) WHERE processed IS NULL;
 
 
 CREATE TABLE flow.dependency
@@ -196,7 +216,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
   )
 WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
 
-\endif
+CREATE INDEX ON async.task((((task_data)->>'flow_id')::BIGINT)) 
+WHERE 
+  processed IS NULL
+  AND ((task_data)->>'flow_id')::BIGINT IS NOT NULL;
+
+END;
+$bootstrap$;
 
 CREATE OR REPLACE FUNCTION flow.finish_parent() RETURNS TRIGGER AS
 $$
@@ -515,7 +541,6 @@ $$ LANGUAGE PLPGSQL;
 /* for a parent node, gives each child node and for those nodes if child
  * dependency requirements are met, so that child tasks can be queued.
  *
- *
  * problem, node child eligible brfore steps complete
  */
 CREATE OR REPLACE FUNCTION flow.node_child_dependencies(
@@ -662,7 +687,9 @@ BEGIN
         ft.step_arguments,
         ft.processing_error))
     FROM flow.v_flow_task t
-    JOIN flow.node n ON n.node = ft.node
+    JOIN flow.node n ON 
+      n.node = ft.node
+      AND t.node = n.node
     WHERE 
       t.flow_id = ft.flow_id
       AND NOT is_node
@@ -672,6 +699,32 @@ BEGIN
     HAVING COUNT(*) > 0;
   ELSEIF ft.is_node
   THEN
+    IF ft.failed
+    THEN
+      /* If there are any running steps underneath this node, fail them out
+       * immediately.  This is unusual, since node completion would generally 
+       * be based on steps completing.  Timeout and manual cancel would be 
+       * reasons why this might occur.
+       */
+      PERFORM async.finish_internal(
+        array_agg(task_id),
+        'FAILED'::async.finish_status_t,
+        'cascaded node failure',
+        format(
+          'Failed due to failure of node %s via %s', 
+          ft.node, 
+          ft.processing_error))
+      FROM flow.v_flow_task t
+      JOIN flow.node n ON 
+        n.node = ft.node
+        AND t.node = n.node
+      WHERE 
+        t.flow_id = ft.flow_id
+        AND NOT is_node
+        AND t.processed IS NULL
+      HAVING COUNT(*) > 0;
+    END IF;
+
     /* The node did not have any steps (or did and failed), or this is the last
      * step to resolve. time to process node dependencies...introduce new task
      * if there are no other unmet dependencies.
@@ -709,48 +762,7 @@ BEGIN
       GROUP BY run_type;
     END IF;
   END IF;  
-
-  /* test if flow is done and close it if so */
-  IF NOT EXISTS (
-    SELECT 1 FROM flow.v_flow_task 
-    WHERE 
-      flow_id = ft.flow_id
-      AND processed IS NULL) 
-    AND ft.is_node
-  THEN
-    /* ensure there are no eligible tasks for any node that is a sibling 
-     * of this node that has eligible tasks to prevent this node from closing
-     * the flow before it has a chance to kick out its tasks.  This can happen
-     * of the tasks complete at the same call to async.finish().
-     */
-    IF NOT EXISTS
-    (
-      SELECT * FROM 
-      (
-        SELECT (flow.node_child_dependencies(p.flow_id, c.child)).eligible
-        FROM flow.dependency p
-        JOIN flow.dependency c ON
-          c.parent = p.parent
-          AND p.flow_id = c.flow_id
-        WHERE 
-          p.flow_id = ft.flow_id
-          AND p.child = ft.node
-          AND c.child != p.child
-      ) WHERE eligible
-    )
-    THEN
-      PERFORM async.log(
-        format(
-          'Finishing flow %s on task complete of task %s node %s',
-          ft.flow_id,
-          ft.task_id,
-          ft.node));
-
-      UPDATE flow.flow SET processed = clock_timestamp() 
-      WHERE flow_id = ft.flow_id;
-    END IF;
-  END IF;
-
+  
   RETURN new;
 END;
 $$ LANGUAGE PLPGSQL;
@@ -880,10 +892,7 @@ CREATE OR REPLACE TRIGGER on_flow_check_node_steps
   )  
   EXECUTE PROCEDURE flow.check_node_steps();
 
-
-SELECT async.push_startup_routine('flow.async_startup()');
-
-/* run clean up processes when orchestator starts */
+/* clean up processes when orchestator starts */
 CREATE OR REPLACE PROCEDURE flow.async_startup() AS
 $$
 BEGIN
@@ -894,6 +903,38 @@ BEGIN
   WHERE flow.processed IS NULL;
 END;
 $$ LANGUAGE PLPGSQL;
+
+/* mark flows finished */
+CREATE OR REPLACE PROCEDURE flow.async_loop() AS
+$$
+DECLARE
+  _finished BIGINT[];
+BEGIN
+  WITH f AS
+  (
+    UPDATE flow.flow f SET processed = clock_timestamp() 
+    WHERE 
+      processed IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM flow.v_flow_task t
+        WHERE 
+          f.flow_id = t.flow_id
+          AND t.processed IS NULL)
+    RETURNING flow_id
+  )
+  SELECT array_agg(flow_id) INTO _finished FROM f;
+
+  IF array_upper(_finished, 1) >= 1
+  THEN
+    PERFORM async.log(
+      format('Finishing flow_ids %s via flow complete', _finished));
+  END IF; 
+END;
+$$ LANGUAGE PLPGSQL;
+
+SELECT async.push_routine('STARTUP', 'flow.async_startup()');
+SELECT async.push_routine('LOOP', 'flow.async_loop()');
+
 
 
 CREATE OR REPLACE FUNCTION flow.configure_flow(
@@ -908,8 +949,9 @@ DECLARE
   _concurrency_group_routine TEXT 
     DEFAULT _configuration->>'concurrency_group_routine';
 BEGIN
-  /* ensure async start up process is installed. */
-  PERFORM async.push_startup_routine('flow.async_startup()');
+  /* Configure async module hooks */
+  PERFORM async.push_routine('STARTUP', 'flow.async_startup()');
+  PERFORM async.push_routine('LOOP', 'flow.async_loop()');
 
   CREATE TEMP TABLE tmp_flow (LIKE flow.flow_configuration) ON COMMIT DROP;
   CREATE TEMP TABLE tmp_node (LIKE flow.node) ON COMMIT DROP;

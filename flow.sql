@@ -4,7 +4,21 @@
 */
 
 
-\if :bootstrap
+DO
+$bootstrap$
+BEGIN
+
+BEGIN
+  PERFORM 1 FROM async.client_control;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Please install async client library first';
+END;
+
+BEGIN
+  PERFORM 1 FROM flow.arguments LIMIT 0;
+  RETURN;
+EXCEPTION WHEN undefined_table THEN NULL;
+END;
 
 CREATE SCHEMA flow;
 
@@ -29,8 +43,8 @@ CREATE TYPE flow.callback_arguments_t AS
 
 CREATE DOMAIN flow.flow_priority_t AS INT CHECK (value BETWEEN -99 AND 99);
 
-
-\endif
+END;
+$bootstrap$;
 
 
 
