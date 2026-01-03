@@ -1,0 +1,4 @@
+comment = 'Client library for flow automation framework'
+default_version = '1.0'
+module_pathname = '$libdir/flow_client'
+relocatable = true

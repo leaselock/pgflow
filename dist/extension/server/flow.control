@@ -1,0 +1,4 @@
+comment = 'Flow automation framework server library'
+default_version = '1.0'
+module_pathname = '$libdir/flow'
+relocatable = true

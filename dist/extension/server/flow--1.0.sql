@@ -1,3 +1,339 @@
+
+/* Implements client side interfaces and and stanard structures for flow 
+ * library. 
+*/
+
+
+DO
+$bootstrap$
+BEGIN
+
+BEGIN
+  PERFORM 1 FROM async.client_control;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Please install async client library first';
+END;
+
+BEGIN
+  PERFORM 1 FROM flow.arguments LIMIT 0;
+  RETURN;
+EXCEPTION WHEN undefined_table THEN NULL;
+END;
+
+CREATE SCHEMA flow;
+
+/* 
+ * flow arguments are cached client side.
+ */
+CREATE TABLE flow.arguments
+(
+  flow_id BIGINT PRIMARY KEY,
+  arguments JSONB
+);
+
+CREATE TYPE flow.callback_arguments_t AS
+(
+  flow_id BIGINT,
+  flow TEXT,
+  flow_arguments JSONB,
+  node TEXT,
+  step_arguments JSONB,
+  task_id BIGINT
+);
+
+CREATE DOMAIN flow.flow_priority_t AS INT CHECK (value BETWEEN -99 AND 99);
+
+END;
+$bootstrap$;
+
+DO
+$code$
+BEGIN
+
+BEGIN
+  PERFORM 1 FROM flow.arguments LIMIT 0;
+EXCEPTION WHEN undefined_table THEN
+  RAISE EXCEPTION 'Flow client library incorrectly installed';
+  RETURN;
+END;
+
+
+/* 
+ * Some nodes initialize steps on the fly.  To avoid race conditions they have 
+ * to be pushed as any other task...the steps much be confirmed before the node
+ * resolves.
+ *
+ * _flush_transaction_when_client: flow.finish() will attempt to flush 
+ *    transaction changes so that the server does not race to push tasks 
+ *    that may race to start before the calling transaction resolves.  This will
+ *    not work if there is error handling outside of this proceure.  Suppressing
+ *    the commit will allow for upper level error handling to occur. 
+ */
+CREATE OR REPLACE PROCEDURE flow.push_steps(
+  _flow_id BIGINT,  
+  _node TEXT,
+  _arguments JSONB[],
+  _flush_transaction_when_client BOOL DEFAULT TRUE) AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
+      async.server(), 
+      format(
+        'CALL flow.push_steps(%s, %s, %s)',
+        quote_literal($1),
+        quote_literal($2),
+        quote_literal($3)));
+
+    RETURN;
+  END IF; 
+
+  PERFORM flow.push_tasks(
+    _flow_id,
+   array_agg((_node, a)::flow.task_wrapper_t),
+   _source := 'push steps')
+  FROM unnest(_arguments) a;
+END;    
+$$ LANGUAGE PLPGSQL;
+
+
+/* Return arguments from the flow.  If they are not in the local cache, go get
+ * them from the orchestrator.
+ */
+CREATE OR REPLACE FUNCTION flow.args(
+  _flow_id BIGINT,
+  args OUT JSONB) RETURNS JSONB AS
+$$
+DECLARE
+  q TEXT;
+BEGIN
+  SELECT INTO args arguments
+  FROM flow.arguments
+  WHERE flow_id = _flow_id;
+
+  IF FOUND
+  THEN
+    RETURN;
+  END IF;
+
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    SELECT INTO args * FROM dblink(
+      async.server(), 
+      format(
+        'SELECT arguments FROM flow.flow WHERE flow_id = %s',
+        _flow_id)) AS R(j JSONB);
+  ELSE
+    SELECT INTO args arguments
+    FROM flow.flow 
+    WHERE flow_id = _flow_id;
+  END IF;
+
+  INSERT INTO flow.arguments
+  SELECT _flow_id, args
+  ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE PLPGSQL;
+
+/* 
+ * Will finish 'in-process' node. Useful when the node is set asynchronous, but
+ * it is deterimined an asynchronous finish is not needed.
+ */
+CREATE OR REPLACE PROCEDURE flow.finish(
+  _args flow.callback_arguments_t,
+  _failed BOOL DEFAULT false,
+  _error_message TEXT DEFAULT NULL,
+  _flush_transaction_when_client BOOL DEFAULT true) AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
+      async.server(), 
+      format(
+        'CALL flow.finish(%s, %s, %s)',
+        quote_literal($1),
+        quote_literal($2),
+        quote_nullable($3)));
+
+    RETURN;
+  END IF; 
+
+  PERFORM async.finish(
+    array[_args.task_id],
+    CASE WHEN _failed THEN 'FAILED' ELSE 'FINISHED' END::async.finish_status_t,
+      _error_message);
+  
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+
+/* Marks a flow and all attached tasks as ineligible to run. Any tasks
+ * running synchronously will be cancelled.
+ */
+CREATE OR REPLACE FUNCTION flow.cancel(
+  _flow_id BIGINT) RETURNS VOID AS
+$$
+DECLARE
+  _task_ids BIGINT[];
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    PERFORM * FROM dblink(
+      async.server(), 
+      format('SELECT 0 FROM flow.cancel(%s)', $1)) AS R(V INT);
+
+    RETURN;
+  END IF; 
+
+  PERFORM async.log(format('Canceling flow %s', _flow_id));
+
+  SELECT INTO _task_ids array_agg(task_id) 
+  FROM flow.v_flow_task 
+  WHERE 
+    flow_id = _flow_id
+    AND processed IS NULL;
+
+  UPDATE flow.flow SET processed = clock_timestamp()
+  WHERE flow_id = _flow_id;
+
+  IF array_upper(_task_ids, 1) >= 1
+  THEN
+    /* If all tasks are complete, flow need to be marked cancelled only. 
+     *
+     * Having no tasks to cancel should be quite rare in regular practice as 
+     * the cancel would have to have lost the race to the last task finishing. 
+     * More likely, an open flow with no extant tasks would be due to bad state 
+     * management or external manipulation of the task table.
+     */
+     PERFORM async.cancel(_task_ids, 'flow cancel');
+  END IF;
+
+  /* cancel child flows (if any) */
+  PERFORM flow.cancel(flow_id)
+  FROM flow.flow
+  WHERE parent_flow_id = _flow_id; 
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+
+/* sets priority of a running flow. */
+CREATE OR REPLACE FUNCTION flow.set_priority(
+  _flow_id BIGINT,
+  _priority flow.flow_priority_t) RETURNS VOID AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    PERFORM * FROM dblink(
+      async.server(), 
+      format('SELECT 0 FROM flow.set_priority(%s)', $1, $2)) AS R(V INT);
+
+    RETURN;
+  END IF; 
+
+  /* do not prioritize flows that are finished */
+  PERFORM 1 FROM flow.flow WHERE flow_id = _flow_id AND processed IS NULL;
+
+  IF NOT FOUND
+  THEN
+    RETURN;
+  END IF;
+
+  UPDATE flow.flow SET force_priority = _priority
+  WHERE 
+    flow_id = _flow_id
+    AND processed IS NULL
+    AND force_priority != _priority;  
+
+  /* adjust flow */
+  UPDATE flow.v_flow_task SET priority = _priority 
+  WHERE 
+    flow_id = _flow_id
+    AND processed IS NULL
+    AND priority != _priority;
+
+  /* adjust child flow */  
+  UPDATE flow.v_flow_task t SET priority = _priority 
+  FROM flow.flow f
+  WHERE
+    f.parent_flow_id = _flow_id
+    AND t.flow_id = f.flow_id
+    AND t.processed IS NULL
+    AND t.priority != _priority;    
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+/* sets priority of a single step of a running flow.  If that step is configured
+ * 'steps_to_flow', the attached flow will be prioritized as well.
+ */
+CREATE OR REPLACE FUNCTION flow.set_step_priority(
+  _flow_id BIGINT,
+  _task_id BIGINT,
+  _priority flow.flow_priority_t) RETURNS VOID AS
+$$
+
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    PERFORM * FROM dblink(
+      async.server(), 
+      format('SELECT 0 FROM flow.set_step_priority(%s)', $1, $2, $3)) 
+        AS R(V INT);
+    RETURN;
+  END IF; 
+
+  /* XXX: only the orchestrator can directly adjust tasks */
+
+  /* do not prioritize flows that are finished */
+  PERFORM 1 FROM flow.flow WHERE flow_id = _flow_id AND processed IS NULL;
+
+  IF NOT FOUND
+  THEN
+    RETURN;
+  END IF;  
+
+  UPDATE flow.v_flow_task SET priority = _priority 
+  WHERE 
+    flow_id = _flow_id
+    AND task_id = _task_id
+    AND processed IS NULL
+    AND priority != _priority
+    AND NOT is_node;
+
+  /* reprioritize any child flows */
+  PERFORM flow.set_priority(flow_id, _priority)
+  FROM flow.flow
+  WHERE 
+    parent_flow_id = _flow_id
+    AND parent_task_id = _task_id
+    AND processed IS NULL;
+END;
+$$ LANGUAGE PLPGSQL;
+
+END;
+$code$;
+
+
+
+
+
+
+
 /* extends async.sql into dependency chain processing and directly interacts
  * with its structures.
  */
@@ -216,9 +552,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
   )
 WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
 
-CREATE INDEX ON async.task(
-  (((task_data)->>'flow_id')::BIGINT),
-  ((task_data)->>'node')) 
+CREATE INDEX ON async.task((((task_data)->>'flow_id')::BIGINT)) 
 WHERE 
   processed IS NULL
   AND ((task_data)->>'flow_id')::BIGINT IS NOT NULL;
@@ -639,18 +973,14 @@ BEGIN
   /* XXX: it may be better to verify parent node is still running before 
    * checking this for performance reasons.
    */
-  IF NOT ft.is_node
-  THEN
-    PERFORM 1 FROM flow.v_flow_task t
-    WHERE 
-      flow_id = ft.flow_id
-      AND node = ft.node
-      AND NOT is_node
-      AND processed IS NULL
-    LIMIT 1;
-
-    _last_step := NOT FOUND;
-  END IF;
+  _last_step := NOT ft.is_node AND NOT EXISTS (
+      SELECT 1 FROM flow.v_flow_task t
+      WHERE 
+        flow_id = ft.flow_id
+        AND node = ft.node
+        AND NOT is_node
+        AND processed IS NULL
+    );
 
   IF NOT ft.is_node AND _last_step
   THEN
@@ -1204,3 +1534,435 @@ $$ LANGUAGE PLPGSQL;
 
 END;
 $code$;
+/* Views and functions to support flow administration from UI */
+
+CREATE OR REPLACE FUNCTION interval_pretty(i INTERVAL) RETURNS TEXT AS
+$$
+  SELECT
+    CASE
+      WHEN d > 0 THEN format('%sd %sh %sm %ss', d, h, m, s)
+      WHEN h > 0 THEN format('%sh %sm %ss', h, m, s)
+      WHEN m > 0 THEN format('%sm %ss', m, s)
+      ELSE format('%ss', s)
+    END
+  FROM
+  (
+    SELECT
+      extract('days' FROM i) d,
+      extract('hours' FROM i) h,
+      extract('minutes' FROM i) m,
+      round(extract('seconds' FROM i)::numeric, 1) s
+  ) q
+$$ LANGUAGE SQL STRICT;
+
+/* get flow data and status */
+CREATE OR REPLACE VIEW flow.v_flow_node_status AS
+  SELECT 
+    f.flow_id,
+    f.flow,
+    n.node,
+    n2.target,
+    t.consumed AS started,
+    t.processed AS finished,
+    CASE 
+      WHEN t.finish_status = 'FINISHED' THEN 'Finished'
+      WHEN t.processed IS NOT NULL THEN 'Failed'
+      WHEN f.processed IS NOT NULL AND t.Consumed IS NULL THEN 'Cancelled'
+      WHEN t.task_id IS NULL THEN 'Pending'
+      WHEN t.yielded IS NOT NULL 
+        AND COUNT(*) FILTER (WHERE step_id IS NOT NULL) > 0 THEN 'Running Steps'
+      WHEN t.yielded IS NOT NULL THEN 'Running Async'
+      WHEN t.consumed IS NOT NULL THEN 'Running'
+      ELSE 'Unknown'
+    END AS status,
+    COUNT(*) FILTER (WHERE s.step_id IS NOT NULL) AS steps,
+    COUNT(*) FILTER (WHERE s.Status = 'Pending') AS steps_pending,
+    COUNT(*) FILTER (WHERE s.Status IN ('Running', 'Running Async')) AS steps_running,
+    COUNT(*) FILTER (WHERE s.Status = 'Finished') AS steps_finished,
+    COUNT(*) FILTER (WHERE s.Status = 'Failed') AS steps_failed,
+    all_steps_must_complete
+  FROM flow.flow f
+  JOIN flow.flow_node n USING(flow)
+  JOIN flow.node n2 USING(node)
+  LEFT JOIN flow.v_flow_task t ON 
+    f.flow_id = t.flow_id
+    AND n.node = t.node
+    AND flow.is_node(t.step_arguments)
+  LEFT JOIN 
+  (
+    SELECT 
+      t.flow_id,
+      t.task_id AS step_id,
+      t.node AS node,
+      CASE 
+        WHEN t.consumed IS NULL THEN 'Pending'
+        WHEN t.processed IS NULL AND t.asynchronous_finish THEN 'Running Async'
+        WHEN t.processed IS NULL THEN 'Running'
+        WHEN t.finish_status = 'FINISHED' THEN 'Finished'
+        WHEN t.processed IS NOT NULL THEN 'Failed'
+        ELSE 'Unknown'
+      END AS status
+    FROM flow.v_flow_task t 
+    WHERE NOT flow.is_node(t.step_arguments)
+  ) s ON 
+    s.flow_id = f.flow_id   
+    AND s.node = n.node
+  GROUP BY 1,2,3, n2.target, t.finish_status, t.processed, t.yielded, 
+    t.consumed, t.task_id, all_steps_must_complete;
+
+
+CREATE OR REPLACE VIEW flow.v_flow_task_status AS
+  SELECT 
+    f.flow_id,
+    t.task_id,
+    CASE WHEN flow.is_node(t.step_arguments) THEN 'Node' ELSE 'Step' END AS Type,
+    f.flow,
+    n.node,
+    n2.target,
+    to_char(t.consumed, 'YYYY-MM-DD HH:MI:SS') AS started,
+    CASE WHEN t.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
+    interval_pretty(COALESCE(t.processed, now()) - t.consumed) AS run_time,
+    CASE 
+      WHEN t.finish_status = 'FINISHED' THEN 'Finished'
+      WHEN t.processed IS NOT NULL THEN 'Failed'
+      WHEN f.processed IS NOT NULL AND t.Consumed IS NULL THEN 'Cancelled'
+      WHEN t.task_id IS NULL THEN 'Pending'
+      WHEN t.consumed IS NULL THEN 'Pending'
+      WHEN t.yielded IS NOT NULL 
+        AND is_node THEN 'Running Steps'
+      WHEN t.yielded IS NOT NULL THEN 'Running Async'
+      WHEN t.consumed IS NOT NULL THEN 'Running'
+      ELSE 'Unknown'
+    END AS status,
+    step_arguments::TEXT AS step_arguments,
+    t.processing_error,
+    replace(t.query, '##flow.TASK_ID##', t.task_id::TEXT) AS query
+  FROM flow.flow f
+  JOIN flow.flow_node n USING(flow)
+  JOIN flow.node n2 USING(node)
+  LEFT JOIN flow.v_flow_task t ON 
+    f.flow_id = t.flow_id
+    AND n.node = t.node;
+
+
+  
+
+CREATE OR REPLACE VIEW flow.v_flow_status_internal AS
+  SELECT
+    f.flow_id,
+    f.flow,
+    CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
+    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    COUNT(*) AS count_nodes,
+    COUNT(*) FILTER (WHERE NOT t.Failed) AS count_finished_nodes,
+    COUNT(*) FILTER (WHERE t.Failed 
+      OR (t.task_id IS NULL AND f.Processed IS NOT NULL)) AS count_failed_nodes,
+    f.arguments,
+    any_value(processing_error ORDER BY t.Processed) 
+      FILTER (
+        WHERE 
+          failed 
+          AND processing_error NOT LIKE 'Failed due to%'
+          AND length(processing_error) > 0
+        )
+      AS first_error
+  FROM flow.flow f
+  LEFT JOIN flow.flow_node n USING(flow)
+  LEFT JOIN flow.v_flow_task t ON
+    f.flow_id = t.flow_id
+    AND n.node = t.node 
+    AND flow.is_node(t.step_arguments)
+  GROUP BY 1,2;
+
+CREATE OR REPLACE VIEW flow.v_flow_status AS
+  SELECT
+    f.flow_id,
+    f.flow,
+    CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
+    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    count_nodes::BIGINT,
+    count_finished_nodes::BIGINT,
+    count_failed_nodes::BIGINT,
+    f.arguments,
+    first_error
+  FROM flow.flow f
+  WHERE count_nodes IS NOT NULL
+  UNION ALL SELECT
+    flow_id,
+    flow,
+    CASE WHEN Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
+    interval_pretty(COALESCE(processed, now()) - created) AS run_time,
+    (i->>'count_nodes')::BIGINT,
+    (i->>'count_finished_nodes')::BIGINT,
+    (i->>'count_failed_nodes')::BIGINT,
+    arguments,
+    i->>'first_error'
+  FROM 
+  (
+    SELECT 
+      f.*, 
+      (
+        SELECT to_json(i)
+        FROM flow.v_flow_status_internal i
+        WHERE flow_id = f.flow_id      
+      ) i
+    FROM flow.flow f
+    WHERE count_nodes IS NULL
+  ) q;
+
+/* list of flows and their configuration */
+DROP VIEW IF EXISTS flow.v_flow_configuration;
+CREATE OR REPLACE VIEW flow.v_flow_configuration AS
+  SELECT 
+    fc.flow,
+    concurrency_group_routine,
+    f.created AS last_execution_time,
+    CASE 
+      WHEN f.processed IS NULL THEN NULL
+      WHEN f.count_failed_nodes = 0 THEN true
+      ELSE false
+    END AS last_execution_success,
+    'RUN' AS flow_concurrency_control,  /* RUN / QUEUE / BLOCK */
+    f.flow_id AS last_execution_flow_id,
+    fl.count_flows_running::INT,
+    0 AS count_flows_pending,
+    fs.first_error AS last_error_message
+  FROM flow.flow_configuration fc
+  LEFT JOIN
+  (
+    SELECT 
+      flow, 
+      max(flow_id) AS flow_id,
+      count(*) FILTER(WHERE processed IS NULL) AS count_flows_running
+    FROM flow.flow
+    GROUP BY 1
+  ) fl USING(flow)
+  LEFT JOIN flow.flow f USING(flow_id)
+  LEFT JOIN flow.v_flow_status fs USING(flow_id);
+
+
+
+
+CREATE OR REPLACE FUNCTION flow.flows(
+  _limit INT DEFAULT 1000) RETURNS JSONB AS
+$$
+  SELECT jsonb_agg(s)
+  FROM 
+  (
+    SELECT * 
+    FROM flow.v_flow_status 
+    ORDER BY flow_id DESC
+    LIMIT _limit
+  ) s;
+$$ LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION flow.task_list(_flow_id BIGINT) RETURNS JSONB AS
+$$
+  SELECT jsonb_agg(t)
+  FROM 
+  (
+    SELECT * FROM flow.v_flow_task_status 
+    WHERE 
+      flow_id = _flow_id
+      ORDER BY task_id DESC
+  ) t;
+$$ LANGUAGE SQL;
+
+
+
+
+CREATE OR REPLACE FUNCTION flow.graphviz_node(
+  _node TEXT,
+  _target TEXT,
+  _steps_overview TEXT,
+  _runtime TEXT,
+  _color TEXT,
+  _pending BOOL,
+  cell OUT TEXT) RETURNS TEXT AS
+$$
+DECLARE
+  _cols TEXT;
+BEGIN
+  SELECT INTO _cols
+    format('<TR><TD BGCOLOR="%s">%s</TD></TR>', _color, _target);
+
+  SELECT INTO cell format($s$
+    "%s" [id=%s
+  label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+    <TR><TD COLSPAN="1">%s</TD></TR>
+    %s
+    %s %s
+    </TABLE>> shape=none  ];
+    $s$,
+    replace(_node, '.', '_'),
+    replace(_node, '.', '_'),
+    _node,
+    _cols ,
+    CASE WHEN _steps_overview != ''
+      THEN format('<TR><TD COLSPAN="1">steps: %s</TD></TR>', _steps_overview)
+      WHEN _pending THEN '<TR><TD COLSPAN="1">steps pending</TD></TR>'
+      ELSE '<TR><TD COLSPAN="1">no steps</TD></TR>'
+    END,
+    CASE WHEN _runtime != ''
+      THEN format('<TR><TD COLSPAN="1">%s</TD></TR>', _runtime)
+      ELSE ''
+    END);
+  END ;
+$$ LANGUAGE PLPGSQL;
+
+
+
+
+
+CREATE OR REPLACE FUNCTION flow.graphviz(
+  _flow_id BIGINT, Data OUT TEXT) RETURNS TEXT AS
+$$
+DECLARE
+  _Tree TEXT;
+  _Format TEXT;
+  f flow.flow;
+
+BEGIN
+  SELECT INTO f * FROM flow.flow WHERE flow_id = _flow_id;
+
+  WITH d AS
+  (
+    SELECT DISTINCT
+      n.node,
+      coalesce(p.parent, 'start') AS parent,
+      coalesce(c.child, 'end') AS child,
+      target,
+      color,
+      p.continue_on_failure,
+      steps_overview,
+      runtime,
+      status,
+      NOT all_steps_must_complete AND steps_overview != '' AS partial_steps
+    FROM
+    (
+      SELECT
+        flow_id,
+        node,
+        target,
+        CASE WHEN Started IS NOT NULL 
+          THEN interval_pretty(coalesce(finished, now()) - started)
+          ELSE '' 
+        END AS runtime,
+        CASE status
+          WHEN 'Pending' THEN 'beige'
+          WHEN 'Running Async' THEN 'orange'
+          WHEN 'Running Steps' THEN 'orange'
+          WHEN 'Running' THEN 'orange'
+          WHEN 'Finished' THEN 'palegreen'
+          WHEN 'Cancelled' THEN 'indianred'
+          WHEN 'Failed' THEN 'indianred'
+          ELSE 'beige'
+        END AS color,
+        CASE WHEN steps > 0
+          THEN
+            format(
+              'pending %s running %s finished %s failed %s',
+              steps_pending,
+              steps_running,
+              steps_finished,
+              steps_failed)
+          ELSE ''
+        END AS steps_overview,
+        status,
+        all_steps_must_complete
+      FROM flow.v_flow_node_status
+    ) n
+    LEFT JOIN
+    (
+      SELECT d.flow_id, parent, child, continue_on_failure
+      FROM flow.dependency d
+      LEFT JOIN flow.v_flow_task t ON
+        d.flow_id = t.flow_id
+        AND d.parent = t.node
+        AND flow.is_node(t.step_arguments)
+    ) p ON n.node = p.child AND n.flow_id = p.flow_id
+    LEFT JOIN
+    (
+      SELECT d.flow_id, parent, child, continue_on_failure
+      FROM flow.dependency d
+      LEFT JOIN flow.v_flow_task t ON
+        d.flow_id = t.flow_id
+        AND d.child = t.node      
+        AND flow.is_node(t.step_arguments)
+    ) c ON n.node = c.parent AND n.flow_id = c.flow_id
+    WHERE n.flow_id = _flow_id
+  )
+  SELECT INTO _Tree, _Format
+    string_agg(
+      format('%s -> %s%s',
+        replace(parent, '.', '_'),
+        replace(node, '.', '_'),
+        CASE 
+          WHEN continue_on_failure AND partial_steps
+            THEN ' [arrowhead=empty, dir=both, arrowtail = "invempty"]'
+          WHEN continue_on_failure AND NOT partial_steps
+            THEN ' [arrowhead=empty]'
+          WHEN NOT continue_on_failure AND partial_steps
+            THEN ' [dir=both, arrowtail = "invempty"]'
+          ELSE ''
+        END), E'\n'
+        ORDER BY parent, node),
+    string_agg(
+      flow.graphviz_node(
+        node,
+        target,
+        steps_overview,
+        runtime ,
+        color,
+        status = 'Pending') , E'\n'
+        ORDER BY parent, node)
+        FILTER(WHERE node != 'end')
+  FROM
+  (
+    SELECT DISTINCT 
+      parent, node, target, color, continue_on_failure, steps_overview, runtime, status, partial_steps
+    FROM d 
+    UNION ALL SELECT DISTINCT 
+      node, 'end', target, color, false, steps_overview, runtime, status, partial_steps
+    FROM d
+    WHERE Child = 'end'
+  ) q;
+
+  SELECT INTO Data format($q$
+digraph "%s" {
+  edge [arrowsize="1.5"]
+
+  %s%s%s
+
+  start [shape=invtriangle label="%s"];
+  end [shape=triangle label = "END"];
+
+  legend  [shape=record];
+  flow_pending [label = "Pending" shape="rectangle" style="striped" fillcolor = "beige"];
+  flow_running [label = "Running" shape="rectangle"  style="striped" fillcolor = "orange"];
+  flow_finished [label = "Finished" shape="rectangle"  style="striped" fillcolor = "palegreen"];
+  flow_failed [label = "Failed" shape="rectangle"  style="striped" fillcolor = "indianred"];
+
+  legend->flow_pending [arrowhead=empty label="  run on fail"];
+  flow_pending->flow_running [label="  fail on fail"];
+  flow_running->flow_finished ;
+  flow_running->flow_failed [label="steps may fail", dir=both, arrowtail = "invempty"];
+
+}$q$,
+  format('%s/%s', f.flow, f.flow_id),
+  _Tree,
+  E'\n',
+  _Format,
+  format(E'%s\nid: %s', f.flow, f.flow_id));
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+
+
+
+
+
+
+
