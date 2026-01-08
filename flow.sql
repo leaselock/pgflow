@@ -178,6 +178,35 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE PROCEDURE flow.defer(
+  _args flow.callback_arguments_t,
+  _duration INTERVAL) AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
+      async.server(), 
+      format(
+        'CALL flow.defer(%s, %s)',
+        quote_literal($1),
+        quote_nullable($2)));
+
+    RETURN;
+  END IF; 
+
+  PERFORM async.defer(
+    array[_args.task_id],
+   _duration);
+  
+END;
+$$ LANGUAGE PLPGSQL;
+
 
 
 /* Marks a flow and all attached tasks as ineligible to run. Any tasks

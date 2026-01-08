@@ -680,7 +680,8 @@ BEGIN
       'task complete last step',
       CASE WHEN _failed_step AND n.all_steps_must_complete 
         THEN format('Steps did not complete from %s', ft.processing_error)
-      END)
+      END,
+      NULL::INTERVAL)
     FROM flow.v_flow_task t
     JOIN flow.node n USING(node)
     WHERE
@@ -702,7 +703,8 @@ BEGIN
         'Failed due to failure of node %s step %s via %s', 
         ft.node, 
         ft.step_arguments,
-        ft.processing_error))
+        ft.processing_error),
+      NULL::INTERVAL)
     FROM flow.v_flow_task t
     JOIN flow.node n ON 
       n.node = ft.node
@@ -730,7 +732,8 @@ BEGIN
         format(
           'Failed due to failure of node %s via %s', 
           ft.node, 
-          ft.processing_error))
+          ft.processing_error),
+        NULL::INTERVAL)
       FROM flow.v_flow_task t
       JOIN flow.node n ON 
         n.node = ft.node
@@ -927,6 +930,8 @@ $$
 DECLARE
   _finished BIGINT[];
 BEGIN
+  SET LOCAL enable_nestloop = false;
+
   WITH f AS
   (
     UPDATE flow.flow f SET processed = clock_timestamp() 

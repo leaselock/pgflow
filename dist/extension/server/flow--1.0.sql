@@ -178,6 +178,35 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+CREATE OR REPLACE PROCEDURE flow.defer(
+  _args flow.callback_arguments_t,
+  _duration INTERVAL) AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
+      async.server(), 
+      format(
+        'CALL flow.defer(%s, %s)',
+        quote_literal($1),
+        quote_nullable($2)));
+
+    RETURN;
+  END IF; 
+
+  PERFORM async.defer(
+    array[_args.task_id],
+   _duration);
+  
+END;
+$$ LANGUAGE PLPGSQL;
+
 
 
 /* Marks a flow and all attached tasks as ineligible to run. Any tasks
@@ -552,7 +581,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
   )
 WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
 
-CREATE INDEX ON async.task((((task_data)->>'flow_id')::BIGINT)) 
+CREATE INDEX ON async.task(
+  (((task_data)->>'flow_id')::BIGINT),
+  ((task_data)->>'node')) 
 WHERE 
   processed IS NULL
   AND ((task_data)->>'flow_id')::BIGINT IS NOT NULL;
@@ -973,14 +1004,18 @@ BEGIN
   /* XXX: it may be better to verify parent node is still running before 
    * checking this for performance reasons.
    */
-  _last_step := NOT ft.is_node AND NOT EXISTS (
-      SELECT 1 FROM flow.v_flow_task t
-      WHERE 
-        flow_id = ft.flow_id
-        AND node = ft.node
-        AND NOT is_node
-        AND processed IS NULL
-    );
+  IF NOT ft.is_node
+  THEN
+    PERFORM 1 FROM flow.v_flow_task t
+    WHERE 
+      flow_id = ft.flow_id
+      AND node = ft.node
+      AND NOT is_node
+      AND processed IS NULL
+    LIMIT 1;
+
+    _last_step := NOT FOUND;
+  END IF;
 
   IF NOT ft.is_node AND _last_step
   THEN
@@ -1010,7 +1045,8 @@ BEGIN
       'task complete last step',
       CASE WHEN _failed_step AND n.all_steps_must_complete 
         THEN format('Steps did not complete from %s', ft.processing_error)
-      END)
+      END,
+      NULL::INTERVAL)
     FROM flow.v_flow_task t
     JOIN flow.node n USING(node)
     WHERE
@@ -1032,7 +1068,8 @@ BEGIN
         'Failed due to failure of node %s step %s via %s', 
         ft.node, 
         ft.step_arguments,
-        ft.processing_error))
+        ft.processing_error),
+      NULL::INTERVAL)
     FROM flow.v_flow_task t
     JOIN flow.node n ON 
       n.node = ft.node
@@ -1060,7 +1097,8 @@ BEGIN
         format(
           'Failed due to failure of node %s via %s', 
           ft.node, 
-          ft.processing_error))
+          ft.processing_error),
+        NULL::INTERVAL)
       FROM flow.v_flow_task t
       JOIN flow.node n ON 
         n.node = ft.node
@@ -1257,6 +1295,8 @@ $$
 DECLARE
   _finished BIGINT[];
 BEGIN
+  SET LOCAL enable_nestloop = false;
+
   WITH f AS
   (
     UPDATE flow.flow f SET processed = clock_timestamp() 
@@ -1580,7 +1620,13 @@ CREATE OR REPLACE VIEW flow.v_flow_node_status AS
     COUNT(*) FILTER (WHERE s.Status IN ('Running', 'Running Async')) AS steps_running,
     COUNT(*) FILTER (WHERE s.Status = 'Finished') AS steps_finished,
     COUNT(*) FILTER (WHERE s.Status = 'Failed') AS steps_failed,
-    all_steps_must_complete
+    all_steps_must_complete,
+    CASE WHEN t.consumed IS NULL 
+      THEN ''
+      ELSE interval_pretty(coalesce(t.processed, now()) - t.consumed) 
+    END AS run_time,
+    greatest(t.consumed, t.processed, t.yielded) AS changed,
+    t.consumed IS NOT NULL AND t.processed IS NULL AS in_progress    
   FROM flow.flow f
   JOIN flow.flow_node n USING(flow)
   JOIN flow.node n2 USING(node)
@@ -1784,7 +1830,7 @@ DECLARE
   _cols TEXT;
 BEGIN
   SELECT INTO _cols
-    format('<TR><TD BGCOLOR="%s">%s</TD></TR>', _color, _target);
+    format('<TR><TD href="%s.target" BGCOLOR="%s">%s</TD></TR>', _node, _color, _target);
 
   SELECT INTO cell format($s$
     "%s" [id=%s
@@ -1800,18 +1846,61 @@ BEGIN
     _node,
     _cols ,
     CASE WHEN _steps_overview != ''
-      THEN format('<TR><TD COLSPAN="1">steps: %s</TD></TR>', _steps_overview)
-      WHEN _pending THEN '<TR><TD COLSPAN="1">steps pending</TD></TR>'
-      ELSE '<TR><TD COLSPAN="1">no steps</TD></TR>'
+      THEN format(
+        '<TR><TD href="%s.steps" COLSPAN="1">steps: %s</TD></TR>', 
+        _node, 
+        _steps_overview)
+      WHEN _pending THEN 
+        format(
+          '<TR><TD href="%s.steps" COLSPAN="1">steps pending</TD></TR>',
+          _node)
+      ELSE 
+        format(
+          '<TR><TD href="%s.steps" COLSPAN="1">no steps</TD></TR>',
+          _node)
     END,
     CASE WHEN _runtime != ''
-      THEN format('<TR><TD COLSPAN="1">%s</TD></TR>', _runtime)
+      THEN format('<TR><TD href="%s.runtime" COLSPAN="1">%s</TD></TR>',
+        _node, 
+        _runtime)
       ELSE ''
     END);
   END ;
 $$ LANGUAGE PLPGSQL;
 
 
+
+CREATE OR REPLACE FUNCTION flow.node_status_color(
+  _status TEXT) RETURNS TEXT AS
+$$
+  SELECT CASE _status
+    WHEN 'Pending' THEN 'beige'
+    WHEN 'Running Async' THEN 'orange'
+    WHEN 'Running Steps' THEN 'orange'
+    WHEN 'Running' THEN 'orange'
+    WHEN 'Finished' THEN 'palegreen'
+    WHEN 'Cancelled' THEN 'indianred'
+    WHEN 'Failed' THEN 'indianred'
+    ELSE 'beige'
+  END;
+$$ LANGUAGE SQL IMMUTABLE;
+
+
+CREATE OR REPLACE FUNCTION flow.steps_overview(
+  s flow.v_flow_node_status) RETURNS TEXT AS
+$$
+  SELECT CASE 
+    WHEN s.steps > 0
+    THEN
+      format(
+        'pending %s running %s finished %s failed %s',
+        s.steps_pending,
+        s.steps_running,
+        s.steps_finished,
+        s.steps_failed)
+    ELSE ''
+  END;
+$$ LANGUAGE SQL IMMUTABLE;
 
 
 
@@ -1836,7 +1925,7 @@ BEGIN
       color,
       p.continue_on_failure,
       steps_overview,
-      runtime,
+      run_time,
       status,
       NOT all_steps_must_complete AND steps_overview != '' AS partial_steps
     FROM
@@ -1845,33 +1934,12 @@ BEGIN
         flow_id,
         node,
         target,
-        CASE WHEN Started IS NOT NULL 
-          THEN interval_pretty(coalesce(finished, now()) - started)
-          ELSE '' 
-        END AS runtime,
-        CASE status
-          WHEN 'Pending' THEN 'beige'
-          WHEN 'Running Async' THEN 'orange'
-          WHEN 'Running Steps' THEN 'orange'
-          WHEN 'Running' THEN 'orange'
-          WHEN 'Finished' THEN 'palegreen'
-          WHEN 'Cancelled' THEN 'indianred'
-          WHEN 'Failed' THEN 'indianred'
-          ELSE 'beige'
-        END AS color,
-        CASE WHEN steps > 0
-          THEN
-            format(
-              'pending %s running %s finished %s failed %s',
-              steps_pending,
-              steps_running,
-              steps_finished,
-              steps_failed)
-          ELSE ''
-        END AS steps_overview,
+        s.run_time,
+        flow.node_status_color(status) AS color,
+        flow.steps_overview(s) AS steps_overview,
         status,
         all_steps_must_complete
-      FROM flow.v_flow_node_status
+      FROM flow.v_flow_node_status s
     ) n
     LEFT JOIN
     (
@@ -1909,22 +1977,21 @@ BEGIN
         END), E'\n'
         ORDER BY parent, node),
     string_agg(
-      flow.graphviz_node(
+      DISTINCT flow.graphviz_node(
         node,
         target,
         steps_overview,
-        runtime ,
+        run_time ,
         color,
-        status = 'Pending') , E'\n'
-        ORDER BY parent, node)
+        status = 'Pending') , E'\n')
         FILTER(WHERE node != 'end')
   FROM
   (
     SELECT DISTINCT 
-      parent, node, target, color, continue_on_failure, steps_overview, runtime, status, partial_steps
+      parent, node, target, color, continue_on_failure, steps_overview, run_time, status, partial_steps
     FROM d 
     UNION ALL SELECT DISTINCT 
-      node, 'end', target, color, false, steps_overview, runtime, status, partial_steps
+      node, 'end', target, color, false, steps_overview, run_time, status, partial_steps
     FROM d
     WHERE Child = 'end'
   ) q;
@@ -1959,9 +2026,25 @@ END;
 $$ LANGUAGE PLPGSQL;
 
 
-
-
-
+CREATE OR REPLACE FUNCTION flow.graphviz_events(
+  _flow_id BIGINT,
+  _since TIMESTAMPTZ, 
+  node OUT TEXT,
+  node_status_color OUT TEXT,
+  node_steps_overview OUT TEXT,
+  run_time OUT TEXT) RETURNS SETOF RECORD AS
+$$
+  SELECT 
+    node,
+    flow.node_status_color(status),
+    flow.steps_overview(s),
+    run_time
+  FROM flow.v_flow_node_status s
+  WHERE
+    flow_id = _flow_id 
+    AND (changed > _since OR in_progress OR _since IS NULL)
+  ORDER BY changed
+$$ LANGUAGE SQL;
 
 
 
