@@ -1295,19 +1295,26 @@ $$
 DECLARE
   _finished BIGINT[];
 BEGIN
-  SET LOCAL enable_nestloop = false;
-
   WITH f AS
   (
-    UPDATE flow.flow f SET processed = clock_timestamp() 
-    WHERE 
-      processed IS NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM flow.v_flow_task t
-        WHERE 
-          f.flow_id = t.flow_id
-          AND t.processed IS NULL)
+    UPDATE flow.flow SET processed = clock_timestamp() 
+    WHERE flow_id IN (
+      SELECT flow_id
+      FROM
+      (
+        SELECT flow_id, 
+          (
+            SELECT task_id 
+            FROM flow.v_flow_task t 
+            WHERE 
+              t.flow_id = f.flow_id 
+              AND processed IS NULL LIMIT 1
+          ) FROM flow.flow f WHERE processed IS NULL
+      )
+      WHERE task_id IS NULL
+    )
     RETURNING flow_id
+    
   )
   SELECT array_agg(flow_id) INTO _finished FROM f;
 
