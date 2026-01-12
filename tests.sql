@@ -23,6 +23,16 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+
+CREATE OR REPLACE PROCEDURE flow_defer_task(
+  _args flow.callback_arguments_t) AS 
+$$
+BEGIN
+  CALL flow.defer(_args, (_args.flow_arguments->>'defer_for')::INTERVAL);
+END;
+$$ LANGUAGE PLPGSQL;
+
+
 CREATE OR REPLACE PROCEDURE flow_insert_test_run(
   _args flow.callback_arguments_t) AS 
 $$
@@ -158,9 +168,26 @@ BEGIN
     ]
   }$j$);
 
+  PERFORM flow.configure_flow(
+    'flow_defer_test',
+    $j$
+  {
+    "nodes": 
+    [
+      {
+        "node": "flow_defer_task",
+        "target": "SELF",
+        "node_timeout": "30 seconds"
+      }
+    ]
+  }$j$);  
+
 END;
 $$ LANGUAGE PLPGSQL;
+
 
 SELECT flow.create_test_flows();
 
 SELECT flow.create_flow('flow_insert_test', '{"rows": 100000}');
+
+SELECT flow.create_flow('flow_defer_test', '{"defer_for": "1 second"}');

@@ -185,11 +185,6 @@ $$
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
-    IF _flush_transaction_when_client
-    THEN
-      COMMIT;
-    END IF;
-
     PERFORM dblink_exec(
       async.server(), 
       format(
@@ -203,7 +198,6 @@ BEGIN
   PERFORM async.defer(
     array[_args.task_id],
    _duration);
-  
 END;
 $$ LANGUAGE PLPGSQL;
 
