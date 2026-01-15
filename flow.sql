@@ -400,7 +400,7 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
-
+END;
 $code$;
 
 
