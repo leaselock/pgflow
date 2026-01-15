@@ -348,7 +348,59 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+
+CREATE OR REPLACE FUNCTION flow.restart_flow(
+  _flow_id BIGINT,
+  _node TEXT DEFAULT NULL) RETURNS VOID AS
+$$
+DECLARE 
+  _flow TEXT;
+BEGIN
+  UPDATE flow.flow SET processed = NULL
+  WHERE processed IS NOT NULL AND flow_id = _flow_id
+  RETURNING flow INTO _flow;
+
+  IF NOT FOUND
+  THEN
+    PERFORM async.log(
+      'ERROR', 
+      format('Flow %s does not exist or is not finished', _flow_id));
+  END IF;
+
+  /* delete all tasks in flow that meet criteria */
+  DELETE FROM flow.v_flow_task t
+  WHERE 
+    flow_id = _flow_id
+    AND
+    (
+      _node IS NULL
+      OR
+      (
+        t.node IN (
+          SELECT child 
+          FROM flow.walk_flow(_flow) 
+          WHERE 
+            tree @> array[_node]
+            AND 
+            (
+              /* XXX: static steps should not be deleted */
+              step_arguments != '{}'
+              OR child != _node
+            )
+        )
+      )
+    );
+
+  PERFORM async.restart_task(task_id)
+  FROM flow.v_flow_task
+  WHERE 
+    flow_id = _flow_id
+    AND node = _node;
+
 END;
+$$ LANGUAGE PLPGSQL;
+
+
 $code$;
 
 

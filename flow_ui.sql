@@ -255,7 +255,7 @@ DECLARE
   _cols TEXT;
 BEGIN
   SELECT INTO _cols
-    format('<TR><TD href="%s.target" BGCOLOR="%s">%s</TD></TR>', _node, _color, _target);
+    format('<TR><TD id="%s.target" BGCOLOR="%s">%s</TD></TR>', _node, _color, _target);
 
   SELECT INTO cell format($s$
     "%s" [id=%s
@@ -272,20 +272,20 @@ BEGIN
     _cols ,
     CASE WHEN _steps_overview != ''
       THEN format(
-        '<TR><TD href="%s.steps" COLSPAN="1">steps: %s</TD></TR>', 
+        '<TR><TD id="%s.steps" COLSPAN="1">steps: %s</TD></TR>', 
         _node, 
         _steps_overview)
       WHEN _pending THEN 
         format(
-          '<TR><TD href="%s.steps" COLSPAN="1">steps pending</TD></TR>',
+          '<TR><TD id="%s.steps" COLSPAN="1">steps pending</TD></TR>',
           _node)
       ELSE 
         format(
-          '<TR><TD href="%s.steps" COLSPAN="1">no steps</TD></TR>',
+          '<TR><TD id="%s.steps" COLSPAN="1">no steps</TD></TR>',
           _node)
     END,
     CASE WHEN _runtime != ''
-      THEN format('<TR><TD href="%s.runtime" COLSPAN="1">%s</TD></TR>',
+      THEN format('<TR><TD id="%s.runtime" COLSPAN="1">%s</TD></TR>',
         _node, 
         _runtime)
       ELSE ''
