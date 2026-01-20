@@ -185,11 +185,6 @@ $$
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
-    IF _flush_transaction_when_client
-    THEN
-      COMMIT;
-    END IF;
-
     PERFORM dblink_exec(
       async.server(), 
       format(
@@ -203,7 +198,6 @@ BEGIN
   PERFORM async.defer(
     array[_args.task_id],
    _duration);
-  
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -253,7 +247,9 @@ BEGIN
   /* cancel child flows (if any) */
   PERFORM flow.cancel(flow_id)
   FROM flow.flow
-  WHERE parent_flow_id = _flow_id; 
+  WHERE 
+    parent_flow_id = _flow_id
+    AND processed IS NULL;
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -351,6 +347,58 @@ BEGIN
     parent_flow_id = _flow_id
     AND parent_task_id = _task_id
     AND processed IS NULL;
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+CREATE OR REPLACE FUNCTION flow.restart_flow(
+  _flow_id BIGINT,
+  _node TEXT DEFAULT NULL) RETURNS VOID AS
+$$
+DECLARE 
+  _flow TEXT;
+BEGIN
+  UPDATE flow.flow SET processed = NULL
+  WHERE processed IS NOT NULL AND flow_id = _flow_id
+  RETURNING flow INTO _flow;
+
+  IF NOT FOUND
+  THEN
+    PERFORM async.log(
+      'ERROR', 
+      format('Flow %s does not exist or is not finished', _flow_id));
+  END IF;
+
+  /* delete all tasks in flow that meet criteria */
+  DELETE FROM flow.v_flow_task t
+  WHERE 
+    flow_id = _flow_id
+    AND
+    (
+      _node IS NULL
+      OR
+      (
+        t.node IN (
+          SELECT child 
+          FROM flow.walk_flow(_flow) 
+          WHERE 
+            tree @> array[_node]
+            AND 
+            (
+              /* XXX: static steps should not be deleted */
+              step_arguments != '{}'
+              OR child != _node
+            )
+        )
+      )
+    );
+
+  PERFORM async.restart_task(task_id)
+  FROM flow.v_flow_task
+  WHERE 
+    flow_id = _flow_id
+    AND node = _node;
+
 END;
 $$ LANGUAGE PLPGSQL;
 
@@ -1583,24 +1631,7 @@ END;
 $code$;
 /* Views and functions to support flow administration from UI */
 
-CREATE OR REPLACE FUNCTION interval_pretty(i INTERVAL) RETURNS TEXT AS
-$$
-  SELECT
-    CASE
-      WHEN d > 0 THEN format('%sd %sh %sm %ss', d, h, m, s)
-      WHEN h > 0 THEN format('%sh %sm %ss', h, m, s)
-      WHEN m > 0 THEN format('%sm %ss', m, s)
-      ELSE format('%ss', s)
-    END
-  FROM
-  (
-    SELECT
-      extract('days' FROM i) d,
-      extract('hours' FROM i) h,
-      extract('minutes' FROM i) m,
-      round(extract('seconds' FROM i)::numeric, 1) s
-  ) q
-$$ LANGUAGE SQL STRICT;
+
 
 /* get flow data and status */
 CREATE OR REPLACE VIEW flow.v_flow_node_status AS
@@ -1630,7 +1661,7 @@ CREATE OR REPLACE VIEW flow.v_flow_node_status AS
     all_steps_must_complete,
     CASE WHEN t.consumed IS NULL 
       THEN ''
-      ELSE interval_pretty(coalesce(t.processed, now()) - t.consumed) 
+      ELSE async.interval_pretty(coalesce(t.processed, now()) - t.consumed) 
     END AS run_time,
     greatest(t.consumed, t.processed, t.yielded) AS changed,
     t.consumed IS NOT NULL AND t.processed IS NULL AS in_progress    
@@ -1674,7 +1705,7 @@ CREATE OR REPLACE VIEW flow.v_flow_task_status AS
     n2.target,
     to_char(t.consumed, 'YYYY-MM-DD HH:MI:SS') AS started,
     CASE WHEN t.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(t.processed, now()) - t.consumed) AS run_time,
+    async.interval_pretty(COALESCE(t.processed, now()) - t.consumed) AS run_time,
     CASE 
       WHEN t.finish_status = 'FINISHED' THEN 'Finished'
       WHEN t.processed IS NOT NULL THEN 'Failed'
@@ -1705,7 +1736,7 @@ CREATE OR REPLACE VIEW flow.v_flow_status_internal AS
     f.flow_id,
     f.flow,
     CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    async.interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
     COUNT(*) AS count_nodes,
     COUNT(*) FILTER (WHERE NOT t.Failed) AS count_finished_nodes,
     COUNT(*) FILTER (WHERE t.Failed 
@@ -1732,7 +1763,7 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     f.flow_id,
     f.flow,
     CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    async.interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
     count_nodes::BIGINT,
     count_finished_nodes::BIGINT,
     count_failed_nodes::BIGINT,
@@ -1744,7 +1775,7 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     flow_id,
     flow,
     CASE WHEN Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(processed, now()) - created) AS run_time,
+    async.interval_pretty(COALESCE(processed, now()) - created) AS run_time,
     (i->>'count_nodes')::BIGINT,
     (i->>'count_finished_nodes')::BIGINT,
     (i->>'count_failed_nodes')::BIGINT,
@@ -1837,7 +1868,7 @@ DECLARE
   _cols TEXT;
 BEGIN
   SELECT INTO _cols
-    format('<TR><TD href="%s.target" BGCOLOR="%s">%s</TD></TR>', _node, _color, _target);
+    format('<TR><TD id="%s.target" BGCOLOR="%s">%s</TD></TR>', _node, _color, _target);
 
   SELECT INTO cell format($s$
     "%s" [id=%s
@@ -1854,20 +1885,20 @@ BEGIN
     _cols ,
     CASE WHEN _steps_overview != ''
       THEN format(
-        '<TR><TD href="%s.steps" COLSPAN="1">steps: %s</TD></TR>', 
+        '<TR><TD id="%s.steps" COLSPAN="1">steps: %s</TD></TR>', 
         _node, 
         _steps_overview)
       WHEN _pending THEN 
         format(
-          '<TR><TD href="%s.steps" COLSPAN="1">steps pending</TD></TR>',
+          '<TR><TD id="%s.steps" COLSPAN="1">steps pending</TD></TR>',
           _node)
       ELSE 
         format(
-          '<TR><TD href="%s.steps" COLSPAN="1">no steps</TD></TR>',
+          '<TR><TD id="%s.steps" COLSPAN="1">no steps</TD></TR>',
           _node)
     END,
     CASE WHEN _runtime != ''
-      THEN format('<TR><TD href="%s.runtime" COLSPAN="1">%s</TD></TR>',
+      THEN format('<TR><TD id="%s.runtime" COLSPAN="1">%s</TD></TR>',
         _node, 
         _runtime)
       ELSE ''

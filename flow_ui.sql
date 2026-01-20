@@ -1,24 +1,7 @@
 
 /* Views and functions to support flow administration from UI */
 
-CREATE OR REPLACE FUNCTION interval_pretty(i INTERVAL) RETURNS TEXT AS
-$$
-  SELECT
-    CASE
-      WHEN d > 0 THEN format('%sd %sh %sm %ss', d, h, m, s)
-      WHEN h > 0 THEN format('%sh %sm %ss', h, m, s)
-      WHEN m > 0 THEN format('%sm %ss', m, s)
-      ELSE format('%ss', s)
-    END
-  FROM
-  (
-    SELECT
-      extract('days' FROM i) d,
-      extract('hours' FROM i) h,
-      extract('minutes' FROM i) m,
-      round(extract('seconds' FROM i)::numeric, 1) s
-  ) q
-$$ LANGUAGE SQL STRICT;
+
 
 /* get flow data and status */
 CREATE OR REPLACE VIEW flow.v_flow_node_status AS
@@ -48,7 +31,7 @@ CREATE OR REPLACE VIEW flow.v_flow_node_status AS
     all_steps_must_complete,
     CASE WHEN t.consumed IS NULL 
       THEN ''
-      ELSE interval_pretty(coalesce(t.processed, now()) - t.consumed) 
+      ELSE async.interval_pretty(coalesce(t.processed, now()) - t.consumed) 
     END AS run_time,
     greatest(t.consumed, t.processed, t.yielded) AS changed,
     t.consumed IS NOT NULL AND t.processed IS NULL AS in_progress    
@@ -92,7 +75,7 @@ CREATE OR REPLACE VIEW flow.v_flow_task_status AS
     n2.target,
     to_char(t.consumed, 'YYYY-MM-DD HH:MI:SS') AS started,
     CASE WHEN t.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(t.processed, now()) - t.consumed) AS run_time,
+    async.interval_pretty(COALESCE(t.processed, now()) - t.consumed) AS run_time,
     CASE 
       WHEN t.finish_status = 'FINISHED' THEN 'Finished'
       WHEN t.processed IS NOT NULL THEN 'Failed'
@@ -123,7 +106,7 @@ CREATE OR REPLACE VIEW flow.v_flow_status_internal AS
     f.flow_id,
     f.flow,
     CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    async.interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
     COUNT(*) AS count_nodes,
     COUNT(*) FILTER (WHERE NOT t.Failed) AS count_finished_nodes,
     COUNT(*) FILTER (WHERE t.Failed 
@@ -150,7 +133,7 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     f.flow_id,
     f.flow,
     CASE WHEN f.Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
+    async.interval_pretty(COALESCE(f.processed, now()) - f.created) AS run_time,
     count_nodes::BIGINT,
     count_finished_nodes::BIGINT,
     count_failed_nodes::BIGINT,
@@ -162,7 +145,7 @@ CREATE OR REPLACE VIEW flow.v_flow_status AS
     flow_id,
     flow,
     CASE WHEN Processed IS NULL THEN 'No' ELSE 'Yes' END AS complete,
-    interval_pretty(COALESCE(processed, now()) - created) AS run_time,
+    async.interval_pretty(COALESCE(processed, now()) - created) AS run_time,
     (i->>'count_nodes')::BIGINT,
     (i->>'count_finished_nodes')::BIGINT,
     (i->>'count_failed_nodes')::BIGINT,

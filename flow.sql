@@ -247,7 +247,9 @@ BEGIN
   /* cancel child flows (if any) */
   PERFORM flow.cancel(flow_id)
   FROM flow.flow
-  WHERE parent_flow_id = _flow_id; 
+  WHERE 
+    parent_flow_id = _flow_id
+    AND processed IS NULL;
 END;
 $$ LANGUAGE PLPGSQL;
 
