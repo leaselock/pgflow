@@ -597,7 +597,6 @@ BEGIN
     ELSE 
       _failed_step := false;
     END IF;
-
     /* all steps mark finished. resolve the node which will then cascade 
      * dependency processing.  Node finish status is based this step status.
      */
@@ -625,27 +624,29 @@ BEGIN
      * 1. halt any other running steps attached to this node. 
      * 2. marked other tasks as ineligible for processing
      */
-    PERFORM async.finish_internal(
-      array_agg(task_id),
-      'FAILED'::async.finish_status_t,
-      'task complete failed',
-      format(
-        'Failed due to failure of node %s step %s via %s', 
-        ft.node, 
-        ft.step_arguments,
-        ft.processing_error),
-      NULL::INTERVAL)
-    FROM flow.v_flow_task t
-    JOIN flow.node n ON 
-      n.node = ft.node
-      AND t.node = n.node
-    WHERE 
-      t.flow_id = ft.flow_id
-      AND NOT is_node
-      AND t.step_arguments != ft.step_arguments
-      AND t.processed IS NULL
-      AND n.all_steps_must_complete
-    HAVING COUNT(*) > 0;
+    IF (
+      SELECT all_steps_must_complete 
+      FROM flow.node n
+      WHERE n.node = ft.node)
+    THEN
+      PERFORM async.finish_internal(
+        array_agg(task_id),
+        'FAILED'::async.finish_status_t,
+        'task complete failed',
+        format(
+          'Failed due to failure of node %s step %s via %s', 
+          ft.node, 
+          ft.step_arguments,
+          ft.processing_error),
+        NULL::INTERVAL)
+      FROM flow.v_flow_task t
+      WHERE 
+        t.flow_id = ft.flow_id
+        AND NOT is_node
+        AND t.step_arguments != ft.step_arguments
+        AND t.processed IS NULL
+      HAVING COUNT(*) > 0;
+    END IF;
   ELSEIF ft.is_node
   THEN
     IF ft.failed
@@ -712,7 +713,6 @@ BEGIN
       GROUP BY run_type;
     END IF;
   END IF;  
-  
   RETURN new;
 END;
 $$ LANGUAGE PLPGSQL;

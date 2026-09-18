@@ -431,10 +431,10 @@ $$
 BEGIN
   IF (SELECT client_only FROM async.client_control)
   THEN
-    PERFORM * FROM dblink(
+     SELECT INTO flow_id * FROM dblink(
       async.server(), 
       format(
-        'SELECT 0 FROM flow.create_flow(%s, %s, %s, %s, %s, %s, %s)', 
+        'SELECT * FROM flow.create_flow(%s, %s, %s, %s, %s, %s, %s)', 
         quote_literal($1), 
         quote_literal($2), 
         quote_nullable($3), 
