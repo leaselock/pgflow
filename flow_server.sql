@@ -83,7 +83,15 @@ CREATE TABLE flow.node
    */
   node_timeout INTERVAL,
 
-  step_timeout INTERVAL
+  step_timeout INTERVAL,
+
+  /* if false, asynchronous steps that yield waiting response will not be 
+   * counted for concurrency.
+   *
+   * 'target' will fall back to track_concurrency_yielded on async.target
+   */
+  track_yielded TEXT DEFAULT 'steps' CHECK (track_yielded IN (
+    'node', 'steps', 'all', 'none', 'target'))
 
 );
 
@@ -426,8 +434,12 @@ BEGIN
           THEN n.node_timeout
           ELSE n.step_timeout 
         END,
-        /* by default, track yieled tasks for steps but not nodes */
-        NOT flow.is_node(t.step_arguments)
+        CASE n.track_yielded
+          WHEN 'all' THEN true
+          WHEN 'none' THEN false
+          WHEN 'node' THEN flow.is_node(t.step_arguments)
+          WHEN 'steps' THEN NOT flow.is_node(t.step_arguments)
+        END
       )::async.task_push_t),
     CASE 
       WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
@@ -540,7 +552,6 @@ DECLARE
   _last_step BOOL;
   _failed_step BOOL;
   _first_failure TEXT;
-  
 BEGIN
   SELECT INTO ft * FROM flow.v_flow_task WHERE task_id = new.task_id;
 
@@ -566,11 +577,15 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  /* XXX: it may be better to verify parent node is still running before 
-   * checking this for performance reasons.
-   */
   IF NOT ft.is_node
   THEN
+    /* Look for failure from all steps trigger and bail if it is deteted.
+     */
+    IF new.processing_error LIKE 'Failed due to failure of node%'
+    THEN
+      RETURN new;
+    END IF;
+
     PERFORM 1 FROM flow.v_flow_task t
     WHERE 
       flow_id = ft.flow_id
@@ -592,6 +607,7 @@ BEGIN
         WHERE
           flow_id = ft.flow_id
           AND node = ft.node
+          AND processed IS NOT NULL
           AND NOT is_node
           AND failed);
     ELSE 
@@ -646,6 +662,21 @@ BEGIN
         AND t.step_arguments != ft.step_arguments
         AND t.processed IS NULL
       HAVING COUNT(*) > 0;
+
+      /* Mark the node finished with failure. */
+      PERFORM async.finish_internal(
+        array[t.task_id], 
+        'FAILED'::async.finish_status_t, 
+        'task complete last step',
+        format('Steps did not complete from %s', ft.processing_error),
+        NULL::INTERVAL)
+      FROM flow.v_flow_task t
+      JOIN flow.node n USING(node)
+      WHERE
+        flow_id = ft.flow_id
+        AND node = ft.node
+        AND processed IS NULL
+        AND is_node;        
     END IF;
   ELSEIF ft.is_node
   THEN
@@ -729,6 +760,7 @@ CREATE OR REPLACE TRIGGER on_flow_task_complete
      * ...task is completing and...
      */
     new.processed IS NOT NULL
+    AND NOT COALESCE(new.processing_error, '') LIKE 'Failed due to failure of node%'
     /* ...this is a task attached to flow  and ... */
     AND (new.task_data->>'flow_id') IS NOT NULL
     /* this is not a failure that itself is trigger fired */    
