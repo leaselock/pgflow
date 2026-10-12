@@ -16,7 +16,7 @@ $$
 DECLARE 
   r RECORD;
   _found BOOL;
-  _error_message TEXT DEFAULT 'Simulated remote failure';
+  _error_message TEXT;
 BEGIN
   PERFORM 1 FROM pg_stat_activity 
   WHERE 
@@ -38,24 +38,28 @@ BEGIN
   );
 
   CREATE INDEX ON async_simulated_task(when_finshed);  
+  CREATE INDEX ON async_simulated_task(task_id);  
 
   COMMIT;
 
   LOOP
     _found := false;
 
-    FOR r IN SELECT * FROM async_simulated_task
+    FOR r IN SELECT 
+        should_fail,
+        array_agg(task_id) AS task_ids 
+      FROM async_simulated_task
       WHERE when_finshed < now()  
-      ORDER BY when_finshed
+      GROUP BY 1
     LOOP
       _found := true;
 
-      DELETE FROM async_simulated_task WHERE task_id = r.task_id;
+      DELETE FROM async_simulated_task WHERE task_id = ANY(r.task_ids);
 
       CALL flow.finish(
-        r.flow_data,
+        r.task_ids,
         r.should_fail,
-        _error_message);
+        CASE WHEN r.should_fail THEN 'simulated remote failure' END);
     END LOOP;
 
     COMMIT;
@@ -172,12 +176,16 @@ $$ LANGUAGE PLPGSQL;
 
 /*
  *
-  select flow.create_test_flows('host=localhost port=5400 user=merlin.moncure dbname=postgres');
+  select flow.create_test_flows(
+    'host=localhost port=5418 user=merlin.moncure dbname=new',
+    'host=localhost port=5418 user=merlin.moncure dbname=new_client');
  */
 
 CREATE OR REPLACE FUNCTION flow.create_test_flows(
   _self_target TEXT DEFAULT 
-    'host=localhost port=5432 user=postgres dbname=postgres',
+    'host=localhost port=5432 user=postgres dbname=server',
+  _remote_target TEXT DEFAULT 
+    'host=localhost port=5432 user=postgres dbname=client',    
   _seed INT DEFAULT 0.5,
   _depth INT DEFAULT 5,
   _breadth INT DEFAULT 5) RETURNS VOID AS
@@ -191,17 +199,19 @@ BEGIN
   PERFORM async.configure(format($j$
   {
     "targets": [
-        { 
-        "target": "SELF", 
+    { 
+        "target": "TEST", 
         "max_concurrency": 50, 
         "default_timeout": "2 hours",
-        "connection_string": "%1$s"
+        "connection_string": "%2$s",
+        "asynchronous_finish": true,
+        "concurrency_track_yielded": false
       },
       { 
-        "target": "SELF_ASYNC", 
+        "target": "TEST_ASYNC", 
         "max_concurrency": 50, 
         "default_timeout": "2 hours",
-        "connection_string": "%1$s",
+        "connection_string": "%2$s",
         "asynchronous_finish": true,
         "concurrency_track_yielded": false
       }
@@ -212,7 +222,8 @@ BEGIN
       "workers": 100
     }
   }$j$, 
-    _self_target)::JSONB);
+    _self_target,
+    _remote_target)::JSONB);
 
   PERFORM setseed(_seed);
 
@@ -253,7 +264,7 @@ BEGIN
             jsonb_build_object(
               'node', 'basic_' || child,
               'routine', 'random_wait',
-              'target', 'SELF',
+              'target', 'TEST',
               CASE WHEN parent IS NOT NULL THEN 'dependencies' ELSE 'dummy' END,
               array[
                   jsonb_build_object(
@@ -278,8 +289,9 @@ BEGIN
             'node', 'async_' || child,
             'routine', 'random_wait_and_finish',
             'synchronous', true,
-            'target', 'SELF_ASYNC',
-            'all_steps_most_complete', false,
+            'target', 'TEST_ASYNC',
+            'all_steps_must_complete', false,
+            'track_yielded', 'none',
             CASE WHEN parent IS NOT NULL THEN 'dependencies' ELSE 'dummy' END,
             array[
                 jsonb_build_object(
@@ -303,11 +315,11 @@ BEGIN
     [
       {
         "node": "flow_insert_test_setup",  
-        "target": "SELF"
+        "target": "TEST"
       },
       {
         "node": "flow_insert_test_run",
-        "target": "SELF",
+        "target": "TEST",
         "step_routine": "flow_insert_test_insert",
         "dependencies": [ {"parent": "flow_insert_test_setup"} ]
       }
@@ -322,7 +334,7 @@ BEGIN
     [
       {
         "node": "flow_defer_task",
-        "target": "SELF",
+        "target": "TEST",
         "node_timeout": "30 seconds"
       }
     ]

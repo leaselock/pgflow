@@ -73,7 +73,8 @@ CREATE OR REPLACE PROCEDURE flow.push_steps(
   _flow_id BIGINT,  
   _node TEXT,
   _arguments JSONB[],
-  _flush_transaction_when_client BOOL DEFAULT TRUE) AS
+  _flush_transaction_when_client BOOL DEFAULT TRUE,
+  _yield_upon_finish BOOL DEFAULT TRUE) AS
 $$
 BEGIN
   IF (SELECT client_only FROM async.client_control)
@@ -86,10 +87,12 @@ BEGIN
     PERFORM dblink_exec(
       async.server(), 
       format(
-        'CALL flow.push_steps(%s, %s, %s)',
+        'CALL flow.push_steps(%s, %s, %s, %s, %s)',
         quote_literal($1),
         quote_literal($2),
-        quote_literal($3)));
+        quote_literal($3),
+        quote_literal($4),
+        quote_literal($5)));
 
     RETURN;
   END IF; 
@@ -100,15 +103,17 @@ BEGIN
    _source := 'push steps')
   FROM unnest(_arguments) a;
 
-  UPDATE flow.v_flow_task SET yield_upon_finish = true
-  WHERE 
-    flow_id = _flow_id
-    AND node = _node 
-    AND is_node
-    AND processed IS NULL
-    AND yield_upon_finish IS NOT TRUE
-    AND array_upper(_arguments, 1) >= 1;
-
+  IF _yield_upon_finish 
+  THEN
+    UPDATE flow.v_flow_task SET yield_upon_finish = true
+    WHERE 
+      flow_id = _flow_id
+      AND node = _node 
+      AND is_node
+      AND processed IS NULL
+      AND yield_upon_finish IS NOT TRUE
+      AND array_upper(_arguments, 1) >= 1;
+  END IF;
 END;    
 $$ LANGUAGE PLPGSQL;
 
@@ -172,7 +177,7 @@ BEGIN
     PERFORM dblink_exec(
       async.server(), 
       format(
-        'CALL flow.finish(%s, %s, %s)',
+        'CALL flow.finish(%s::flow.callback_arguments_t, %s, %s)',
         quote_literal($1),
         quote_literal($2),
         quote_nullable($3)));
@@ -182,6 +187,41 @@ BEGIN
 
   PERFORM async.finish(
     array[_args.task_id],
+    CASE WHEN _failed THEN 'FAILED' ELSE 'FINISHED' END::async.finish_status_t,
+      _error_message);
+  
+END;
+$$ LANGUAGE PLPGSQL;
+
+
+/* fast path for bulk finish by task id array */
+CREATE OR REPLACE PROCEDURE flow.finish(
+  _task_ids BIGINT[],
+  _failed BOOL DEFAULT false,
+  _error_message TEXT DEFAULT NULL,
+  _flush_transaction_when_client BOOL DEFAULT true) AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    IF _flush_transaction_when_client
+    THEN
+      COMMIT;
+    END IF;
+
+    PERFORM dblink_exec(
+      async.server(), 
+      format(
+        'CALL flow.finish(%s::BIGINT[], %s, %s)',
+        quote_literal($1),
+        quote_literal($2),
+        quote_nullable($3)));
+
+    RETURN;
+  END IF; 
+
+  PERFORM async.finish(
+    _task_ids,
     CASE WHEN _failed THEN 'FAILED' ELSE 'FINISHED' END::async.finish_status_t,
       _error_message);
   

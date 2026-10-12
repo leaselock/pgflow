@@ -914,7 +914,8 @@ BEGIN
     step_routine = t.step_routine,
     synchronous = COALESCE(t.synchronous, n.synchronous),
     node_timeout = t.node_timeout,
-    step_timeout = t.step_timeout
+    step_timeout = t.step_timeout,
+    track_yielded = t.track_yielded
   FROM tmp_node t
   WHERE t.node = n.node;
 
