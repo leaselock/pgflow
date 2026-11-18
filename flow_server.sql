@@ -658,6 +658,7 @@ BEGIN
       FROM flow.v_flow_task t
       WHERE 
         t.flow_id = ft.flow_id
+        AND t.node = ft.node
         AND NOT is_node
         AND t.step_arguments != ft.step_arguments
         AND t.processed IS NULL
