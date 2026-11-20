@@ -419,7 +419,7 @@ BEGIN
         n.target,
         COALESCE(f.force_priority, n.priority),
         flow.configure_callback(
-          CASE WHEN flow.is_node(t.step_arguments) 
+          CASE WHEN flow.is_node(t.step_arguments)
             THEN COALESCE(n.node_routine, n.routine, n.node)
             ELSE COALESCE(n.step_routine, n.routine, n.node)
           END,
@@ -430,9 +430,9 @@ BEGIN
           n.steps_to_flow,
           COALESCE(f.force_priority, n.priority)),
         flow.concurrency_group(_flow_id, node),
-        CASE WHEN flow.is_node(t.step_arguments) 
+        CASE WHEN flow.is_node(t.step_arguments)
           THEN n.node_timeout
-          ELSE n.step_timeout 
+          ELSE n.step_timeout
         END,
         CASE n.track_yielded
           WHEN 'all' THEN true
@@ -440,24 +440,25 @@ BEGIN
           WHEN 'node' THEN flow.is_node(t.step_arguments)
           WHEN 'steps' THEN NOT flow.is_node(t.step_arguments)
         END
-      )::async.task_push_t),
-    CASE 
+      )::async.task_push_t ORDER BY ordinality),
+    CASE
       WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
         THEN 'EXECUTE_NOASYNC'
       ELSE _run_type
     END,
     _source)
   FROM flow.flow f
-  CROSS JOIN 
+  CROSS JOIN
   (
-    SELECT  
+    SELECT
       node,
-      step_arguments
-    FROM unnest(_tasks) t
+      step_arguments,
+      ordinality
+    FROM unnest(_tasks) WITH ORDINALITY t(node, step_arguments)
     WHERE NOT EXISTS (
-      SELECT 1 
+      SELECT 1
       FROM flow.v_flow_task vt
-      WHERE 
+      WHERE
         vt.flow_id = _flow_id
         AND vt.node = t.node
         AND vt.step_arguments = t.step_arguments
@@ -465,13 +466,13 @@ BEGIN
   ) t
   JOIN flow.node n USING(node)
   WHERE f.flow_id = _flow_id
-  GROUP BY CASE 
+  GROUP BY CASE
       WHEN _run_type = 'EXECUTE' AND t.step_arguments = '{}' AND n.synchronous
         THEN 'EXECUTE_NOASYNC'
       ELSE _run_type
     END;
 
-  FOR r IN 
+  FOR r IN
     SELECT
       node,
       array_agg(arguments) args
@@ -481,7 +482,7 @@ BEGIN
     GROUP BY 1
   LOOP
     CALL flow.push_steps(
-      _flow_id,  
+      _flow_id,
       r.node,
       r.args);
   END LOOP;
